@@ -1,6 +1,6 @@
 """
 LIMRA AI Helper Module
-Gemini 3 Flash Preview를 사용한 AI 기능
+Groq + Qwen2.5-72B를 사용한 AI 기능
 - PDF 요약
 - 키워드 확장
 - 리포트 생성
@@ -10,7 +10,7 @@ import os
 import json
 from pathlib import Path
 from typing import List, Dict, Optional
-import google.generativeai as genai
+from groq import Groq
 
 # PDF 텍스트 추출
 try:
@@ -22,28 +22,28 @@ except ImportError:
 
 
 class LimraAIHelper:
-    """Gemini 3 Flash Preview를 사용한 AI 도우미"""
+    """Groq + Qwen2.5-72B를 사용한 AI 도우미"""
 
     def __init__(self, api_key: Optional[str] = None):
         """
         Args:
-            api_key: Google AI API 키 (없으면 환경변수 GOOGLE_API_KEY 사용)
+            api_key: Groq API 키 (없으면 환경변수 GROQ_API_KEY 사용)
         """
-        self.api_key = api_key or os.environ.get("GOOGLE_API_KEY")
+        self.api_key = api_key or os.environ.get("GROQ_API_KEY")
 
         if not self.api_key:
             raise ValueError(
-                "Google API 키가 필요합니다.\n"
-                "1. https://aistudio.google.com/app/apikey 에서 API 키 생성\n"
-                "2. 환경변수 설정: set GOOGLE_API_KEY=your_api_key\n"
+                "Groq API 키가 필요합니다.\n"
+                "1. https://console.groq.com/keys 에서 API 키 생성\n"
+                "2. 환경변수 설정: set GROQ_API_KEY=your_api_key\n"
                 "   또는 LimraAIHelper(api_key='your_api_key') 로 직접 전달"
             )
 
-        # Gemini 설정
-        genai.configure(api_key=self.api_key)
-        self.model = genai.GenerativeModel('gemini-2.0-flash')
+        # Groq 클라이언트 설정
+        self.client = Groq(api_key=self.api_key)
+        self.model = "llama-3.3-70b-versatile"  # Llama 3.3 70B
 
-        print("[OK] Gemini AI 초기화 완료")
+        print("[OK] Groq + Llama 3.3 70B 초기화 완료")
 
     def extract_pdf_text(self, pdf_path: str, max_pages: int = 20) -> str:
         """PDF에서 텍스트 추출
@@ -118,8 +118,19 @@ class LimraAIHelper:
 간결하고 명확하게 작성해주세요."""
 
         try:
-            response = self.model.generate_content(prompt)
-            summary = response.text
+            chat_completion = self.client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                model=self.model,
+                temperature=0.3,
+                max_tokens=2000,
+            )
+
+            summary = chat_completion.choices[0].message.content
 
             print("[OK] PDF 요약 완료")
 
@@ -174,8 +185,19 @@ JSON 형식으로 응답해주세요:
 영어 키워드로 생성해주세요 (LIMRA는 영어 사이트입니다)."""
 
         try:
-            response = self.model.generate_content(prompt)
-            text = response.text
+            chat_completion = self.client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                model=self.model,
+                temperature=0.7,
+                max_tokens=1500,
+            )
+
+            text = chat_completion.choices[0].message.content
 
             # JSON 추출 (마크다운 코드블록 제거)
             if "```json" in text:
@@ -192,6 +214,7 @@ JSON 형식으로 응답해주세요:
                     all_keywords.extend(result[key])
 
             result["all_keywords"] = list(set(all_keywords))  # 중복 제거
+            result["expanded_keywords"] = result["all_keywords"]  # 호환성을 위해 추가
 
             print(f"[OK] {len(result['all_keywords'])}개 키워드 생성 완료")
 
@@ -202,7 +225,7 @@ JSON 형식으로 응답해주세요:
             return {
                 "original": keyword,
                 "all_keywords": [keyword],
-                "raw_response": response.text if 'response' in dir() else str(e),
+                "raw_response": text if 'text' in dir() else str(e),
                 "error": "JSON 파싱 실패"
             }
 
@@ -271,8 +294,19 @@ JSON 형식으로 응답해주세요:
 전문적이면서도 이해하기 쉽게 작성해주세요."""
 
         try:
-            response = self.model.generate_content(prompt)
-            report = response.text
+            chat_completion = self.client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                model=self.model,
+                temperature=0.5,
+                max_tokens=3000,
+            )
+
+            report = chat_completion.choices[0].message.content
 
             print("[OK] 리포트 생성 완료")
 
@@ -310,22 +344,37 @@ JSON 형식으로 응답해주세요:
 
         return summaries
 
+    def generate_comprehensive_report(self, keyword: str, summaries: List, language: str = "ko") -> Dict:
+        """여러 PDF 요약을 기반으로 종합 리포트 생성 (web_app.py 호환성)"""
+        # 요약을 문서 형식으로 변환
+        documents = []
+        for summary in summaries:
+            if isinstance(summary, dict) and summary.get('summary'):
+                documents.append({
+                    'title': summary.get('file', 'Unknown'),
+                    'type': 'PDF',
+                    'summary': summary['summary'][:200]
+                })
+
+        # generate_report 호출
+        return self.generate_report(documents, keyword, language)
+
 
 # 테스트 코드
 if __name__ == "__main__":
     import sys
 
     print("=" * 60)
-    print("LIMRA AI Helper - Test")
+    print("LIMRA AI Helper - Groq + Qwen2.5 Test")
     print("=" * 60)
 
     # API 키 확인
-    api_key = os.environ.get("GOOGLE_API_KEY")
+    api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
-        print("\n[ERROR] GOOGLE_API_KEY 환경변수가 설정되지 않았습니다.")
+        print("\n[ERROR] GROQ_API_KEY 환경변수가 설정되지 않았습니다.")
         print("설정 방법:")
-        print("  Windows: set GOOGLE_API_KEY=your_api_key")
-        print("  또는 .env 파일에 GOOGLE_API_KEY=your_api_key 추가")
+        print("  Windows: set GROQ_API_KEY=your_api_key")
+        print("  또는 직접 전달: LimraAIHelper(api_key='your_key')")
         sys.exit(1)
 
     try:
@@ -340,7 +389,7 @@ if __name__ == "__main__":
         print(json.dumps(result, indent=2, ensure_ascii=False))
 
         # 2. PDF 요약 테스트 (파일이 있는 경우)
-        test_folder = Path("C:/Users/CHECK/limra_agent/limra_downloads")
+        test_folder = Path("./limra_downloads")
         pdf_files = list(test_folder.glob("*.pdf"))
 
         if pdf_files:

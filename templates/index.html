@@ -489,9 +489,6 @@
     <!-- Header -->
     <header class="header">
         <div class="logo">
-            <div class="logo-icon">
-                <span class="material-icons">search</span>
-            </div>
             <div class="logo-text"><span>LIMRA</span> Document Search</div>
         </div>
         <div id="statusBadge" class="status-badge offline">
@@ -561,6 +558,10 @@
                 </div>
 
                 <div class="btn-group">
+                    <button id="aiSearchBtn" class="btn btn-primary" onclick="aiSmartSearch()" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
+                        <span class="material-icons">auto_awesome</span>
+                        AI Smart Search
+                    </button>
                     <button id="searchBtn" class="btn btn-primary" onclick="search()">
                         <span class="material-icons">search</span>
                         Search Research
@@ -570,6 +571,10 @@
                         Logout
                     </button>
                 </div>
+
+                <p class="helper-text" style="margin-top: 8px;">
+                    💡 <strong>AI Smart Search:</strong> Research 탭에서 키워드 검색 → PDF 다운로드 → AI가 모든 문서 분석 → Word 보고서 생성
+                </p>
 
                 <div id="progressContainer" style="display: none;">
                     <div class="progress-bar">
@@ -668,22 +673,72 @@
 
                 const data = await response.json();
 
-                if (data.success) {
+                if (data.success && data.status === 'processing') {
+                    // 백그라운드에서 로그인 진행 중 - 상태 폴링 시작
+                    showMessage('loginMessage', data.message, 'info');
+                    pollLoginStatus();
+                } else if (data.success) {
                     isLoggedIn = true;
                     updateStatus(true);
                     document.getElementById('loginCard').style.display = 'none';
                     document.getElementById('searchCard').style.display = 'block';
                     document.getElementById('resultsCard').style.display = 'block';
                     showMessage('searchMessage', 'Ready to search LIMRA Research documents.', 'success');
+                    btn.disabled = false;
+                    btn.innerHTML = '<span class="material-icons">login</span> Login';
                 } else {
                     showMessage('loginMessage', data.message, 'error');
+                    btn.disabled = false;
+                    btn.innerHTML = '<span class="material-icons">login</span> Login';
                 }
             } catch (e) {
                 showMessage('loginMessage', 'Connection error: ' + e.message, 'error');
+                btn.disabled = false;
+                btn.innerHTML = '<span class="material-icons">login</span> Login';
             }
+        }
 
-            btn.disabled = false;
-            btn.innerHTML = '<span class="material-icons">login</span> Login';
+        // 로그인 상태 폴링
+        async function pollLoginStatus() {
+            const btn = document.getElementById('loginBtn');
+            const maxAttempts = 120; // 최대 2분 (120초)
+            let attempts = 0;
+
+            const interval = setInterval(async () => {
+                attempts++;
+                try {
+                    const response = await fetch('/api/status');
+                    const status = await response.json();
+
+                    showMessage('loginMessage', status.message || 'Processing...', 'info');
+
+                    if (status.logged_in) {
+                        clearInterval(interval);
+                        isLoggedIn = true;
+                        aiEnabled = status.ai_enabled || false;
+                        updateStatus(true);
+                        document.getElementById('loginCard').style.display = 'none';
+                        document.getElementById('searchCard').style.display = 'block';
+                        document.getElementById('resultsCard').style.display = 'block';
+                        showMessage('searchMessage', 'Ready to search LIMRA Research documents.' + (aiEnabled ? ' AI features enabled.' : ''), 'success');
+                        btn.disabled = false;
+                        btn.innerHTML = '<span class="material-icons">login</span> Login';
+                    } else if (!status.is_running && attempts > 5) {
+                        // 로그인이 실패하고 더 이상 진행되지 않음
+                        clearInterval(interval);
+                        showMessage('loginMessage', status.message || 'Login failed', 'error');
+                        btn.disabled = false;
+                        btn.innerHTML = '<span class="material-icons">login</span> Login';
+                    } else if (attempts >= maxAttempts) {
+                        clearInterval(interval);
+                        showMessage('loginMessage', 'Login timeout', 'error');
+                        btn.disabled = false;
+                        btn.innerHTML = '<span class="material-icons">login</span> Login';
+                    }
+                } catch (e) {
+                    console.error('Status poll error:', e);
+                }
+            }, 1000); // 1초마다 확인
         }
 
         // Search
@@ -713,7 +768,11 @@
 
                 const data = await response.json();
 
-                if (data.success) {
+                if (data.success && data.status === 'processing') {
+                    // 백그라운드에서 검색 진행 중 - 상태 폴링 시작
+                    showMessage('searchMessage', data.message, 'info');
+                    pollSearchStatus(autoDownload);
+                } else if (data.success) {
                     results = data.results;
                     renderResults(results);
                     showMessage('searchMessage', data.message, 'success');
@@ -721,16 +780,166 @@
                     if (autoDownload) {
                         loadFiles();
                     }
+                    showProgress(false);
+                    btn.disabled = false;
+                    btn.innerHTML = '<span class="material-icons">search</span> Search Research';
                 } else {
                     showMessage('searchMessage', data.message, 'error');
+                    showProgress(false);
+                    btn.disabled = false;
+                    btn.innerHTML = '<span class="material-icons">search</span> Search Research';
                 }
             } catch (e) {
                 showMessage('searchMessage', 'Search error: ' + e.message, 'error');
+                showProgress(false);
+                btn.disabled = false;
+                btn.innerHTML = '<span class="material-icons">search</span> Search Research';
+            }
+        }
+
+        // AI 스마트 검색
+        async function aiSmartSearch() {
+            if (!aiEnabled) {
+                showMessage('searchMessage', 'AI 기능이 활성화되지 않았습니다.', 'warning');
+                return;
             }
 
-            showProgress(false);
-            btn.disabled = false;
-            btn.innerHTML = '<span class="material-icons">search</span> Search Research';
+            const keywords = document.getElementById('keywords').value.trim();
+            if (!keywords) {
+                showMessage('searchMessage', 'Please enter a keyword', 'warning');
+                return;
+            }
+
+            const btn = document.getElementById('aiSearchBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<div class="spinner"></div> AI Searching...';
+            showProgress(true, 'AI가 LIMRA 사이트를 검색하고 분석 중...');
+
+            try {
+                const response = await fetch('/api/ai-smart-search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        keyword: keywords,
+                        max_pages: 20
+                    })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    showMessage('searchMessage', data.message, 'info');
+                    pollAISearchStatus();
+                } else {
+                    showMessage('searchMessage', data.message, 'error');
+                    showProgress(false);
+                    btn.disabled = false;
+                    btn.innerHTML = '<span class="material-icons">auto_awesome</span> AI Smart Search';
+                }
+            } catch (e) {
+                showMessage('searchMessage', 'AI search error: ' + e.message, 'error');
+                showProgress(false);
+                btn.disabled = false;
+                btn.innerHTML = '<span class="material-icons">auto_awesome</span> AI Smart Search';
+            }
+        }
+
+        // AI 검색 상태 폴링
+        async function pollAISearchStatus() {
+            const btn = document.getElementById('aiSearchBtn');
+            const maxAttempts = 600; // 최대 10분
+            let attempts = 0;
+            let lastMessage = '';
+
+            const interval = setInterval(async () => {
+                attempts++;
+                try {
+                    const response = await fetch('/api/status');
+                    const status = await response.json();
+
+                    if (status.message !== lastMessage) {
+                        showMessage('searchMessage', status.message || 'AI 분석 중...', 'info');
+                        lastMessage = status.message;
+                    }
+
+                    if (!status.is_running) {
+                        clearInterval(interval);
+
+                        if (status.message.includes('완료')) {
+                            showMessage('searchMessage', status.message, 'success');
+                            // 파일 목록 새로고침
+                            loadFiles();
+                            switchTab('files');
+                        } else {
+                            showMessage('searchMessage', status.message || 'AI 검색 완료', 'info');
+                        }
+
+                        showProgress(false);
+                        btn.disabled = false;
+                        btn.innerHTML = '<span class="material-icons">auto_awesome</span> AI Smart Search';
+                    } else if (attempts >= maxAttempts) {
+                        clearInterval(interval);
+                        showMessage('searchMessage', 'AI 검색 타임아웃', 'error');
+                        showProgress(false);
+                        btn.disabled = false;
+                        btn.innerHTML = '<span class="material-icons">auto_awesome</span> AI Smart Search';
+                    }
+                } catch (e) {
+                    // 계속 시도
+                }
+            }, 1000);
+        }
+
+        // 검색 상태 폴링
+        async function pollSearchStatus(autoDownload) {
+            const btn = document.getElementById('searchBtn');
+            const maxAttempts = 300; // 최대 5분
+            let attempts = 0;
+            let lastMessage = '';
+
+            const interval = setInterval(async () => {
+                attempts++;
+                try {
+                    const response = await fetch('/api/status');
+                    const status = await response.json();
+
+                    if (status.message !== lastMessage) {
+                        showMessage('searchMessage', status.message || 'Searching...', 'info');
+                        lastMessage = status.message;
+                    }
+
+                    if (!status.is_running && status.results && status.results.length > 0) {
+                        // 검색 완료
+                        clearInterval(interval);
+                        results = status.results;
+                        renderResults(results);
+                        showMessage('searchMessage', status.message, 'success');
+
+                        if (autoDownload) {
+                            loadFiles();
+                        }
+                        showProgress(false);
+                        btn.disabled = false;
+                        btn.innerHTML = '<span class="material-icons">search</span> Search Research';
+                    } else if (!status.is_running && attempts > 5) {
+                        // 검색 실패 또는 결과 없음
+                        clearInterval(interval);
+                        showMessage('searchMessage', status.message || 'No results found', 'warning');
+                        renderResults([]);
+                        showProgress(false);
+                        btn.disabled = false;
+                        btn.innerHTML = '<span class="material-icons">search</span> Search Research';
+                    } else if (attempts >= maxAttempts) {
+                        clearInterval(interval);
+                        showMessage('searchMessage', 'Search timeout', 'error');
+                        showProgress(false);
+                        btn.disabled = false;
+                        btn.innerHTML = '<span class="material-icons">search</span> Search Research';
+                    }
+                } catch (e) {
+                    console.error('Search status poll error:', e);
+                }
+            }, 1000); // 1초마다 확인
         }
 
         // Render results
@@ -835,14 +1044,78 @@
                 return;
             }
 
-            container.innerHTML = files.map(file => `
+            // 전체 삭제 버튼 추가
+            const headerHtml = files.length > 0 ? `
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; padding: 10px; background: #f8f9fa; border-radius: 8px;">
+                    <span style="color: #666; font-size: 14px;">${files.length}개 파일</span>
+                    <button onclick="deleteAllFiles()" style="padding: 8px 16px; background: #dc3545; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; display: flex; align-items: center; gap: 5px;">
+                        <span class="material-icons" style="font-size: 18px;">delete_sweep</span>
+                        전체 삭제
+                    </button>
+                </div>
+            ` : '';
+
+            container.innerHTML = headerHtml + files.map(file => `
                 <div class="file-item">
                     <span class="material-icons file-icon">picture_as_pdf</span>
                     <span class="file-name">${file.name}</span>
                     <span class="file-size">${formatSize(file.size)}</span>
-                    <span class="material-icons file-download" onclick="window.open('/downloads/${file.name}', '_blank')">download</span>
+                    ${aiEnabled ? `<span class="material-icons file-download" onclick="summarizePDF('${file.name}')" title="AI Summary" style="color: #4285f4;">auto_awesome</span>` : ''}
+                    <span class="material-icons file-download" onclick="window.open('/downloads/${file.name}', '_blank')" title="Download">download</span>
+                    <span class="material-icons file-download" onclick="deleteFile('${file.name}')" title="Delete" style="color: #dc3545;">delete</span>
                 </div>
             `).join('');
+        }
+
+        // Delete single file
+        async function deleteFile(filename) {
+            if (!confirm(`"${filename}" 파일을 삭제하시겠습니까?`)) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/files/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filename: filename })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    showMessage('searchMessage', data.message, 'success');
+                    loadFiles(); // 파일 목록 새로고침
+                } else {
+                    showMessage('searchMessage', data.message, 'error');
+                }
+            } catch (e) {
+                showMessage('searchMessage', 'File delete error: ' + e.message, 'error');
+            }
+        }
+
+        // Delete all files
+        async function deleteAllFiles() {
+            if (!confirm('모든 다운로드 파일을 삭제하시겠습니까?\n(로그 파일과 세션 파일은 제외됩니다)')) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/files/delete-all', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    showMessage('searchMessage', data.message, 'success');
+                    loadFiles(); // 파일 목록 새로고침
+                } else {
+                    showMessage('searchMessage', data.message, 'error');
+                }
+            } catch (e) {
+                showMessage('searchMessage', 'File delete error: ' + e.message, 'error');
+            }
         }
 
         // Format file size
@@ -865,13 +1138,94 @@
             }
         }
 
-        // Logout
+        // ============= AI Functions =============
+        let aiEnabled = false;
+
+        async function expandKeywords() {
+            const btn = document.getElementById('expandKeywordsBtn');
+            const keywordsInput = document.getElementById('keywords');
+            const currentKeyword = keywordsInput.value.trim();
+
+            if (!currentKeyword) {
+                showMessage('searchMessage', 'Please enter a keyword first', 'warning');
+                return;
+            }
+
+            btn.disabled = true;
+            btn.innerHTML = '<div class="spinner"></div> AI...';
+
+            try {
+                const response = await fetch('/api/ai/expand-keywords', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ keyword: currentKeyword, language: 'ko' })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    // all_keywords에서 원본 키워드를 제외한 나머지 키워드들을 가져옴
+                    const allKeywords = data.all_keywords || data.expanded_keywords || [];
+                    const expanded = allKeywords.filter(k => k.toLowerCase() !== currentKeyword.toLowerCase());
+
+                    if (expanded.length > 0) {
+                        const newKeywords = [currentKeyword, ...expanded].join(', ');
+                        keywordsInput.value = newKeywords;
+                        showMessage('searchMessage', `AI expanded ${expanded.length} keywords: ${expanded.join(', ')}`, 'success');
+                    } else {
+                        showMessage('searchMessage', 'No additional keywords suggested', 'info');
+                    }
+                } else {
+                    showMessage('searchMessage', data.message, 'error');
+                }
+            } catch (e) {
+                showMessage('searchMessage', 'Keyword expansion error: ' + e.message, 'error');
+            }
+
+            btn.disabled = false;
+            btn.innerHTML = '<span class="material-icons">auto_awesome</span> AI Expand';
+        }
+
+        async function summarizePDF(filename) {
+            if (!aiEnabled) {
+                alert('Please enable AI features first');
+                return;
+            }
+
+            showProgress(true, `AI summarizing: ${filename}...`);
+
+            try {
+                const response = await fetch('/api/ai/summarize-pdf', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filename: filename, language: 'ko' })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    const summary = data.summary;
+                    alert(`PDF Summary of ${filename}:\n\n` +
+                          `Title: ${summary.title || 'N/A'}\n\n` +
+                          `Key Points:\n${(summary.key_points || []).join('\n')}\n\n` +
+                          `Summary:\n${summary.summary || 'No summary available'}`);
+                } else {
+                    alert('Summarization failed: ' + data.message);
+                }
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
+
+            showProgress(false);
+        }
+
         async function logout() {
             try {
                 await fetch('/api/logout', { method: 'POST' });
             } catch (e) {}
 
             isLoggedIn = false;
+            aiEnabled = false;
             updateStatus(false);
             document.getElementById('loginCard').style.display = 'block';
             document.getElementById('searchCard').style.display = 'none';

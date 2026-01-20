@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, quote_plus
 
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+import requests
 
 
 class LimraSearchAgent:
@@ -27,6 +28,12 @@ class LimraSearchAgent:
         "https://www.limra.com/en/research/retirement/",
         "https://www.limra.com/en/research/annuities/",
         "https://www.limra.com/en/research/workplace-benefits/",
+    ]
+
+    NEWS_URLS = [
+        "https://www.limra.com/en/newsroom/",
+        "https://www.limra.com/en/newsroom/news-releases/",
+        "https://www.limra.com/en/newsroom/industry-trends/",
     ]
 
     def __init__(
@@ -52,7 +59,7 @@ class LimraSearchAgent:
         self.search_results = []
 
     async def initialize(self):
-        """브라우저 초기화"""
+        """브라우저 초기화 (저장된 세션 자동 로드)"""
         print("[*] 브라우저 초기화 중...")
         self._playwright = await async_playwright().start()
 
@@ -69,12 +76,25 @@ class LimraSearchAgent:
             downloads_path=str(self.download_folder.absolute())  # Playwright 다운로드 경로
         )
 
-        # PDF 자동 다운로드 설정
-        self.context = await self.browser.new_context(
-            viewport={'width': 1920, 'height': 1080},
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            accept_downloads=True,
-        )
+        # 저장된 세션 확인
+        session_file = self.download_folder / "limra_session.json"
+        context_options = {
+            'viewport': {'width': 1920, 'height': 1080},
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'accept_downloads': True,
+        }
+
+        # 저장된 세션이 있으면 자동으로 로드
+        if session_file.exists():
+            print(f"[SESSION] 저장된 세션 발견: {session_file}")
+            try:
+                context_options['storage_state'] = str(session_file)
+                print("[SESSION] 세션을 자동으로 로드합니다...")
+            except Exception as e:
+                print(f"[SESSION] 세션 로드 실패: {e}")
+
+        # PDF 자동 다운로드 설정 (세션 포함)
+        self.context = await self.browser.new_context(**context_options)
 
         # 메인 페이지 생성
         self.page = await self.context.new_page()
@@ -102,26 +122,204 @@ class LimraSearchAgent:
 
         print("[OK] 브라우저 초기화 완료")
 
-    async def login(self) -> bool:
-        """LIMRA 웹사이트 로그인 (2단계 로그인 지원)"""
-        print(f"[*] 로그인 시도 중... ({self.email})")
+    async def load_session(self) -> bool:
+        """저장된 세션 쿠키 로드"""
+        session_file = self.download_folder / "limra_session.json"
+
+        if session_file.exists():
+            try:
+                print(f"[SESSION] 저장된 세션 로드 중: {session_file}")
+                with open(session_file, 'r') as f:
+                    storage_state = json.load(f)
+
+                # 쿠키 복원
+                if 'cookies' in storage_state:
+                    await self.context.add_cookies(storage_state['cookies'])
+                    print(f"[SESSION] {len(storage_state['cookies'])}개 쿠키 로드 완료")
+
+                    # 세션 유효성 확인
+                    await self.page.goto(self.BASE_URL)
+                    await asyncio.sleep(2)
+
+                    # 로그인 상태 확인 (여러 방법)
+                    is_logged_in = await self._check_if_logged_in()
+
+                    if is_logged_in:
+                        self.is_logged_in = True
+                        print("[SESSION] [OK] 세션이 유효합니다. 로그인 건너뜀")
+                        return True
+                    else:
+                        print("[SESSION] [WARN] 세션이 만료되었습니다. 재로그인 필요")
+                        return False
+            except Exception as e:
+                print(f"[SESSION] 세션 로드 실패: {e}")
+                return False
+        else:
+            print("[SESSION] 저장된 세션이 없습니다")
+            return False
+
+    async def _check_if_logged_in(self) -> bool:
+        """현재 페이지에서 로그인 상태 확인"""
+        try:
+            current_url = self.page.url
+            content = await self.page.content()
+            content_lower = content.lower()
+
+            # 방법 1: URL 확인 - 로그인 페이지가 아니면 로그인 상태일 가능성 높음
+            if 'login' in current_url.lower() or 'log-in' in current_url.lower():
+                print("[CHECK] URL에 login 포함 - 로그인 안됨")
+                return False
+
+            # 방법 2: 로그아웃 버튼/링크 확인 (영어/한국어)
+            logout_indicators = [
+                'logout', 'log out', 'sign out', 'signout',
+                '로그아웃', '로그 아웃', '나가기'
+            ]
+            for indicator in logout_indicators:
+                if indicator in content_lower:
+                    print(f"[CHECK] '{indicator}' 발견 - 로그인 상태 확인")
+                    return True
+
+            # 방법 3: 로그인 버튼/링크 확인 - 있으면 로그인 안된 상태
+            login_indicators = [
+                'href="/login"', 'href="/log-in"', 'href="/en/log-in"',
+                '>log in<', '>login<', '>sign in<',
+                '>로그인<'
+            ]
+            for indicator in login_indicators:
+                if indicator in content_lower:
+                    print(f"[CHECK] '{indicator}' 발견 - 로그인 안됨")
+                    return False
+
+            # 방법 4: My Account, Profile 등 로그인 후에만 보이는 요소 확인
+            account_indicators = [
+                'my account', 'myaccount', 'my profile', 'myprofile',
+                'welcome,', '내 계정', '프로필'
+            ]
+            for indicator in account_indicators:
+                if indicator in content_lower:
+                    print(f"[CHECK] '{indicator}' 발견 - 로그인 상태 확인")
+                    return True
+
+            # 방법 5: 쿠키 확인 - 인증 관련 쿠키가 있는지
+            cookies = await self.context.cookies()
+            auth_cookie_names = ['auth', 'token', 'session', 'user', '.aspnet']
+            for cookie in cookies:
+                cookie_name_lower = cookie.get('name', '').lower()
+                for auth_name in auth_cookie_names:
+                    if auth_name in cookie_name_lower:
+                        print(f"[CHECK] 인증 쿠키 '{cookie['name']}' 발견")
+                        # 쿠키만으로는 확정할 수 없으므로 URL 체크와 함께 판단
+                        if 'limra.com' in current_url and 'login' not in current_url.lower():
+                            return True
+
+            print("[CHECK] 로그인 상태 불확실 - 로그인 안된 것으로 간주")
+            return False
+
+        except Exception as e:
+            print(f"[CHECK] 로그인 상태 확인 오류: {e}")
+            return False
+
+    async def manual_login_once(self) -> bool:
+        """최초 1회 수동 로그인 - 브라우저를 열어두고 충분한 시간 제공"""
+        print("\n" + "="*60)
+        print("[MANUAL LOGIN] 수동 로그인 모드")
+        print("="*60)
+        print("브라우저가 열립니다. 다음 작업을 수행하세요:")
+        print("1. 이메일과 비밀번호 입력")
+        print("2. CAPTCHA 해결")
+        print("3. 로그인 완료 후 메인 페이지 확인")
+        print("\n120초 대기 후 자동으로 세션을 저장합니다...")
+        print("="*60 + "\n")
 
         try:
             # 로그인 페이지로 이동
             await self.page.goto(self.LOGIN_URL, wait_until='networkidle', timeout=60000)
+
+            # 사용자가 수동으로 로그인할 시간 제공 (2분)
+            await asyncio.sleep(120)
+
+            # 로그인 확인
+            current_url = self.page.url
+            page_content = await self.page.content()
+
+            if any([
+                'logout' in page_content.lower(),
+                'sign out' in page_content.lower(),
+                'limra.com' in current_url and 'login' not in current_url.lower()
+            ]):
+                print("[SUCCESS] 로그인 성공! 세션을 저장합니다...")
+                self.is_logged_in = True
+
+                # 세션 저장
+                storage_state = await self.context.storage_state()
+                session_path = self.download_folder / "limra_session.json"
+                with open(session_path, 'w') as f:
+                    json.dump(storage_state, f)
+                print(f"[SUCCESS] 세션 저장 완료: {session_path}")
+                print("[INFO] 다음번부터는 CAPTCHA 없이 자동 로그인됩니다!\n")
+
+                return True
+            else:
+                print("[ERROR] 로그인이 완료되지 않았습니다.")
+                return False
+
+        except Exception as e:
+            print(f"[ERROR] 수동 로그인 실패: {e}")
+            return False
+
+    async def login(self) -> bool:
+        """LIMRA 웹사이트 로그인 (2단계 로그인 지원)"""
+        # 먼저 저장된 세션 시도
+        if await self.load_session():
+            return True
+
+        # 로그 파일 생성
+        log_file = self.download_folder / f"login_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+        def log(msg):
+            timestamp = datetime.now().strftime('%H:%M:%S')
+            log_msg = f"[{timestamp}] {msg}"
+            print(log_msg)
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(log_msg + '\n')
+
+        log(f"[*] 로그인 시도 시작... ({self.email})")
+        log(f"[DEBUG] 로그 파일: {log_file}")
+
+        try:
+            # 로그인 페이지로 이동
+            log(f"[STEP 1] 로그인 페이지로 이동 중: {self.LOGIN_URL}")
+            await self.page.goto(self.LOGIN_URL, wait_until='networkidle', timeout=60000)
+            log("[STEP 1] 페이지 로드 완료, 3초 대기 중...")
             await asyncio.sleep(3)
 
             # 현재 URL 확인 (리다이렉트 될 수 있음)
             current_url = self.page.url
-            print(f"[>] 현재 페이지: {current_url}")
+            log(f"[STEP 1] 현재 페이지: {current_url}")
+
+            # 이미 로그인 상태인지 확인 (로그인 페이지로 갔는데 메인으로 리다이렉트된 경우)
+            if 'limra.com' in current_url and 'login' not in current_url.lower() and 'account' not in current_url.lower():
+                log("[STEP 1] 이미 로그인 상태로 감지됨! 로그인 건너뜀")
+                self.is_logged_in = True
+                # 세션 저장
+                try:
+                    storage_state = await self.context.storage_state()
+                    session_path = self.download_folder / "limra_session.json"
+                    with open(session_path, 'w') as f:
+                        json.dump(storage_state, f)
+                    log(f"[SESSION] 세션 저장됨: {session_path}")
+                except Exception as save_err:
+                    log(f"[WARN] 세션 저장 실패: {save_err}")
+                return True
 
             # === 1단계: 이메일 입력 ===
-            print("\n[1단계] 이메일 입력...")
+            log("\n[STEP 2] 이메일 입력 단계 시작...")
 
             # 이메일 입력 필드 찾기
+            log("[STEP 2] 이메일 입력 필드 찾는 중...")
             email_selectors = [
                 'input[type="email"]',
-                'input[type="text"]',
                 'input[name="email"]',
                 'input[name="Email"]',
                 'input[name="username"]',
@@ -132,38 +330,137 @@ class LimraSearchAgent:
                 '.email-input',
                 'input[placeholder*="email" i]',
                 'input[placeholder*="이메일" i]',
-                'input:visible',
+                # 로그인 폼 내의 text input만 선택 (검색창 제외)
+                'form input[type="text"]',
             ]
 
             email_input = None
-            for selector in email_selectors:
+            for i, selector in enumerate(email_selectors, 1):
                 try:
+                    log(f"[STEP 2] 시도 {i}/{len(email_selectors)}: {selector}")
                     email_input = await self.page.wait_for_selector(selector, timeout=3000)
                     if email_input and await email_input.is_visible():
-                        print(f"[OK] 이메일 필드 발견: {selector}")
+                        log(f"[OK] 이메일 필드 발견: {selector}")
                         break
-                except:
+                except Exception as e:
+                    log(f"[SKIP] {selector} - {type(e).__name__}")
                     continue
 
             if not email_input:
                 # 페이지 소스 저장하여 디버깅
+                log("[ERROR] 이메일 필드를 찾을 수 없음! 디버그 정보 저장 중...")
                 html = await self.page.content()
                 debug_path = self.download_folder / "debug_login_page.html"
                 with open(debug_path, 'w', encoding='utf-8') as f:
                     f.write(html)
-                print(f"[WARN] 이메일 필드를 찾을 수 없습니다. 페이지 소스 저장됨: {debug_path}")
+                log(f"[SAVED] 페이지 소스: {debug_path}")
 
                 # 스크린샷 저장
                 screenshot_path = self.download_folder / "debug_login_screenshot.png"
                 await self.page.screenshot(path=str(screenshot_path))
-                print(f"[IMG] 스크린샷 저장됨: {screenshot_path}")
+                log(f"[SAVED] 스크린샷: {screenshot_path}")
                 return False
 
             # 이메일 입력
+            log(f"[STEP 2] 이메일 입력 중: {self.email}")
             await email_input.fill(self.email)
+            log("[STEP 2] 이메일 입력 완료, 1초 대기...")
             await asyncio.sleep(1)
 
+            # reCAPTCHA 체크 (선택적, 90초 대기)
+            log("[STEP 3] reCAPTCHA 확인 중...")
+            captcha_frame = None
+            try:
+                # reCAPTCHA iframe 찾기
+                captcha_frame = await self.page.wait_for_selector('iframe[src*="recaptcha"]', timeout=3000)
+                if captcha_frame:
+                    log("[!] reCAPTCHA 감지됨! 수동으로 체크박스를 클릭하세요.")
+                    log("[!] 90초 대기 중...")
+
+                    # CAPTCHA가 해결될 때까지 대기 (최대 90초)
+                    for i in range(90):
+                        await asyncio.sleep(1)
+
+                        # 페이지 URL 확인 (CAPTCHA 완료 후 자동 로그인되면 페이지가 이동함)
+                        try:
+                            current_url = self.page.url
+                            if 'limra.com' in current_url and 'login' not in current_url.lower() and 'discovery' not in current_url.lower():
+                                log(f"[OK] CAPTCHA 완료 후 자동 로그인됨! URL: {current_url}")
+                                break
+                        except:
+                            pass
+
+                        # CAPTCHA 응답 확인
+                        try:
+                            captcha_response = await self.page.evaluate('''
+                                () => {
+                                    const response = document.querySelector('[name="g-recaptcha-response"]');
+                                    return response ? response.value : null;
+                                }
+                            ''')
+                            if captcha_response:
+                                log(f"[OK] reCAPTCHA 해결됨! ({i+1}초 경과)")
+                                await asyncio.sleep(2)  # CAPTCHA 완료 후 페이지 전환 대기
+                                break
+                        except:
+                            pass
+
+                        if i % 10 == 9:
+                            log(f"[...] {i+1}초 경과... CAPTCHA를 완료해주세요.")
+                    else:
+                        log("[WARN] CAPTCHA 대기 시간 초과")
+
+            except Exception as captcha_err:
+                log(f"[i] reCAPTCHA 없음: {type(captcha_err).__name__}")
+
+            log("[STEP 3] CAPTCHA 확인 완료, 2초 대기...")
+            await asyncio.sleep(2)
+
+            # CAPTCHA 완료 후 페이지 상태 확인 (자동 로그인 감지)
+            try:
+                current_url = self.page.url
+                log(f"[STEP 3.5] CAPTCHA 후 현재 URL: {current_url}")
+
+                # 이미 메인 페이지로 이동했다면 로그인 성공
+                if 'limra.com' in current_url and 'login' not in current_url.lower():
+                    log("[SUCCESS] CAPTCHA 완료 후 자동으로 로그인되었습니다!")
+                    self.is_logged_in = True
+
+                    # 세션 저장
+                    try:
+                        storage_state = await self.context.storage_state()
+                        session_path = self.download_folder / "limra_session.json"
+                        with open(session_path, 'w') as f:
+                            json.dump(storage_state, f)
+                        log(f"[SESSION] 세션 저장됨: {session_path}")
+                    except Exception as save_err:
+                        log(f"[WARN] 세션 저장 실패: {type(save_err).__name__}")
+
+                    return True
+            except Exception as e:
+                log(f"[WARN] URL 확인 실패: {type(e).__name__}, 계속 진행...")
+
+            # 페이지가 닫혔는지 확인
+            try:
+                current_url = self.page.url
+                log(f"[STEP 4] 버튼 찾기 전 URL: {current_url}")
+            except Exception as e:
+                log(f"[ERROR] 페이지가 이미 닫혔습니다: {type(e).__name__}")
+                # 새 페이지를 다시 가져오기 시도
+                try:
+                    pages = self.context.pages
+                    if pages:
+                        self.page = pages[0]
+                        log(f"[RECOVER] 첫 번째 페이지로 복구: {self.page.url}")
+                    else:
+                        log("[ERROR] 사용 가능한 페이지가 없습니다")
+                        return False
+                except Exception as e2:
+                    log(f"[ERROR] 페이지 복구 실패: {type(e2).__name__}")
+                    return False
+
             # 로그인/다음 버튼 클릭 (1단계)
+            log("[STEP 4] 첫 번째 버튼 찾는 중...")
             first_button_selectors = [
                 'button[type="submit"]',
                 'input[type="submit"]',
@@ -178,47 +475,100 @@ class LimraSearchAgent:
             ]
 
             first_button = None
-            for selector in first_button_selectors:
+            for i, selector in enumerate(first_button_selectors, 1):
                 try:
+                    log(f"[STEP 4] 버튼 시도 {i}/{len(first_button_selectors)}: {selector}")
                     first_button = await self.page.wait_for_selector(selector, timeout=2000)
                     if first_button and await first_button.is_visible():
-                        print(f"[OK] 1단계 버튼 발견: {selector}")
+                        log(f"[OK] 1단계 버튼 발견: {selector}")
                         break
-                except:
+                except Exception as e:
+                    log(f"[SKIP] {selector} - {type(e).__name__}")
+                    # TargetClosedError면 페이지가 닫혔으므로 복구 시도
+                    if 'TargetClosedError' in str(type(e).__name__):
+                        log("[WARN] 페이지가 닫혔습니다. 현재 페이지 확인 중...")
+                        try:
+                            pages = self.context.pages
+                            if pages:
+                                self.page = pages[0]
+                                log(f"[RECOVER] 페이지 복구됨: {self.page.url}")
+                                # 이미 로그인되었는지 확인
+                                if 'limra.com' in self.page.url and 'login' not in self.page.url.lower():
+                                    log("[CHECK] 로그인 페이지가 아닙니다. 로그인 상태 확인 중...")
+                                    break
+                        except:
+                            pass
                     continue
 
+            # 버튼이 없으면 이미 로그인되었을 수 있음
+            if not first_button:
+                log("[STEP 4] 버튼을 찾지 못함. 이미 로그인되었는지 확인 중...")
+                try:
+                    current_url = self.page.url
+                    if 'limra.com' in current_url and 'login' not in current_url.lower():
+                        log("[STEP 4] 로그인 페이지가 아닙니다. STEP 5로 건너뜁니다.")
+                        # 비밀번호 단계로 직접 이동
+                    else:
+                        log("[STEP 4] 버튼 없음, Enter 키 시도...")
+                        try:
+                            async with self.page.expect_navigation(timeout=15000, wait_until='networkidle'):
+                                await email_input.press('Enter')
+                            log("[STEP 4] Enter 키 완료 (페이지 이동됨)")
+                        except Exception as nav_err:
+                            log(f"[i] Enter 키 완료 ({type(nav_err).__name__})")
+                except Exception as e:
+                    log(f"[WARN] URL 확인 중 오류: {type(e).__name__}")
+
             # 첫 번째 버튼 클릭 (네비게이션 발생 대비)
-            try:
-                if first_button:
+            elif first_button:
+                log("[STEP 4] 버튼 클릭 시도 중...")
+                try:
                     # 네비게이션이 발생할 수 있으므로 expect_navigation 사용
+                    log("[STEP 4] 버튼 클릭 실행...")
                     try:
                         async with self.page.expect_navigation(timeout=15000, wait_until='networkidle'):
                             await first_button.click()
+                        log("[STEP 4] 버튼 클릭 완료 (페이지 이동됨)")
                     except Exception as nav_err:
                         # 네비게이션이 없을 수도 있음 - 무시
-                        print(f"  [i] 1단계 클릭 완료 ({type(nav_err).__name__})")
-                else:
-                    try:
-                        async with self.page.expect_navigation(timeout=15000, wait_until='networkidle'):
-                            await email_input.press('Enter')
-                    except Exception as nav_err:
-                        print(f"  [i] Enter 키 완료 ({type(nav_err).__name__})")
-            except Exception as click_err:
-                print(f"  [WARN] 1단계 버튼 클릭 중 오류: {click_err}")
-                # 클릭 오류 시에도 계속 진행
+                        log(f"[i] 1단계 클릭 완료 ({type(nav_err).__name__})")
+                except Exception as click_err:
+                    log(f"[WARN] 1단계 버튼 클릭 중 오류: {click_err}")
+                    # 클릭 오류 시에도 계속 진행
 
-            print("[...] 다음 단계 대기 중...")
+            log("[...] 다음 단계 대기 중... (4초)")
             await asyncio.sleep(4)
 
             try:
+                log("[STEP 4] 페이지 로드 대기 중...")
                 await self.page.wait_for_load_state('networkidle', timeout=30000)
-            except:
-                pass  # 타임아웃 무시
+                log("[STEP 4] 페이지 로드 완료")
+            except Exception as e:
+                log(f"[STEP 4] 페이지 로드 타임아웃 ({type(e).__name__}), 계속 진행...")
 
             # === 2단계: 비밀번호 입력 ===
-            print("\n[2단계] 비밀번호 입력...")
+            log("\n[STEP 5] 비밀번호 입력 단계 시작...")
+
+            # 페이지 복구 확인
+            try:
+                current_url = self.page.url
+                log(f"[STEP 5] 현재 URL: {current_url}")
+            except Exception as e:
+                log(f"[WARN] 페이지 URL 접근 실패: {type(e).__name__}")
+                try:
+                    pages = self.context.pages
+                    if pages:
+                        self.page = pages[0]
+                        log(f"[RECOVER] 페이지 복구됨: {self.page.url}")
+                    else:
+                        log("[ERROR] 사용 가능한 페이지 없음")
+                        return False
+                except Exception as e2:
+                    log(f"[ERROR] 페이지 복구 실패: {type(e2).__name__}")
+                    return False
 
             # 비밀번호 필드 찾기
+            log("[STEP 5] 비밀번호 필드 찾는 중...")
             password_selectors = [
                 'input[type="password"]',
                 'input[name="password"]',
@@ -230,34 +580,86 @@ class LimraSearchAgent:
             ]
 
             password_input = None
-            for selector in password_selectors:
+            for i, selector in enumerate(password_selectors, 1):
                 try:
+                    log(f"[STEP 5] 비밀번호 시도 {i}/{len(password_selectors)}: {selector}")
                     password_input = await self.page.wait_for_selector(selector, timeout=5000)
                     if password_input and await password_input.is_visible():
-                        print(f"[OK] 비밀번호 필드 발견: {selector}")
+                        log(f"[OK] 비밀번호 필드 발견: {selector}")
                         break
-                except:
+                except Exception as e:
+                    log(f"[SKIP] {selector} - {type(e).__name__}")
+                    # TargetClosedError면 페이지 복구 시도
+                    if 'TargetClosedError' in str(type(e).__name__):
+                        log("[WARN] 페이지가 닫혔습니다. 복구 시도 중...")
+                        try:
+                            pages = self.context.pages
+                            if pages:
+                                self.page = pages[0]
+                                log(f"[RECOVER] 페이지 복구됨: {self.page.url}")
+                                break
+                        except:
+                            pass
                     continue
 
             if not password_input:
-                print("[WARN] 비밀번호 필드를 찾을 수 없습니다. 스크린샷 저장 중...")
-                screenshot_path = self.download_folder / "debug_password_step.png"
-                await self.page.screenshot(path=str(screenshot_path))
-                print(f"[IMG] 스크린샷 저장됨: {screenshot_path}")
+                log("[WARN] 비밀번호 필드를 찾을 수 없습니다.")
 
                 # 이미 로그인 된 상태일 수 있음
-                page_content = await self.page.content()
-                if 'logout' in page_content.lower() or 'sign out' in page_content.lower():
-                    print("[OK] 이미 로그인된 상태입니다!")
-                    self.is_logged_in = True
-                    return True
+                log("[CHECK] 로그인 상태 확인 중...")
+                try:
+                    current_url = self.page.url
+                    page_content = await self.page.content()
+
+                    if 'logout' in page_content.lower() or 'sign out' in page_content.lower():
+                        log("[SUCCESS] 이미 로그인된 상태입니다!")
+                        self.is_logged_in = True
+
+                        # 세션 저장
+                        storage_state = await self.context.storage_state()
+                        session_path = self.download_folder / "limra_session.json"
+                        with open(session_path, 'w') as f:
+                            json.dump(storage_state, f)
+                        log(f"[SESSION] 세션 저장됨: {session_path}")
+
+                        return True
+
+                    # 로그인 페이지가 아니면 로그인 성공으로 간주
+                    if 'limra.com' in current_url and 'login' not in current_url.lower():
+                        log("[SUCCESS] 로그인 페이지가 아닙니다. 로그인 성공으로 간주합니다.")
+                        self.is_logged_in = True
+
+                        # 세션 저장
+                        storage_state = await self.context.storage_state()
+                        session_path = self.download_folder / "limra_session.json"
+                        with open(session_path, 'w') as f:
+                            json.dump(storage_state, f)
+                        log(f"[SESSION] 세션 저장됨: {session_path}")
+
+                        return True
+
+                except Exception as e:
+                    log(f"[ERROR] 로그인 상태 확인 실패: {type(e).__name__}")
+
+                # 스크린샷 저장 시도
+                try:
+                    screenshot_path = self.download_folder / "debug_password_step.png"
+                    await self.page.screenshot(path=str(screenshot_path))
+                    log(f"[SAVED] 스크린샷: {screenshot_path}")
+                except:
+                    log("[WARN] 스크린샷 저장 실패")
+
+                log("[ERROR] 비밀번호 필드 없음, 로그인 실패")
                 return False
 
             # 비밀번호 입력
+            log("[STEP 5] 비밀번호 입력 중...")
             await password_input.fill(self.password)
+            log("[STEP 5] 비밀번호 입력 완료, 1초 대기...")
             await asyncio.sleep(1)
 
             # 로그인 버튼 클릭 (2단계)
+            log("[STEP 6] 로그인 버튼 찾는 중...")
             login_button_selectors = [
                 'button[type="submit"]',
                 'input[type="submit"]',
@@ -272,45 +674,56 @@ class LimraSearchAgent:
             ]
 
             login_button = None
-            for selector in login_button_selectors:
+            for i, selector in enumerate(login_button_selectors, 1):
                 try:
+                    log(f"[STEP 6] 로그인 버튼 시도 {i}/{len(login_button_selectors)}: {selector}")
                     login_button = await self.page.wait_for_selector(selector, timeout=2000)
                     if login_button and await login_button.is_visible():
-                        print(f"[OK] 로그인 버튼 발견: {selector}")
+                        log(f"[OK] 로그인 버튼 발견: {selector}")
                         break
-                except:
+                except Exception as e:
+                    log(f"[SKIP] {selector} - {type(e).__name__}")
                     continue
 
             # 로그인 버튼 클릭 (네비게이션 발생 시 예외 무시)
+            log("[STEP 6] 로그인 버튼 클릭 시도...")
             try:
                 if login_button:
+                    log("[STEP 6] 로그인 버튼 클릭 실행...")
                     # Promise.all 패턴으로 클릭과 네비게이션 동시 처리
                     async with self.page.expect_navigation(timeout=30000, wait_until='networkidle'):
                         await login_button.click()
+                    log("[STEP 6] 로그인 버튼 클릭 완료 (페이지 이동됨)")
                 else:
+                    log("[STEP 6] 로그인 버튼 없음, Enter 키 시도...")
                     async with self.page.expect_navigation(timeout=30000, wait_until='networkidle'):
                         await password_input.press('Enter')
+                    log("[STEP 6] Enter 키 완료 (페이지 이동됨)")
             except Exception as nav_error:
                 # 네비게이션 중 요소 분리 오류는 무시 (실제로 로그인 성공했을 가능성)
-                print(f"[...] 페이지 네비게이션 중... ({type(nav_error).__name__})")
+                log(f"[...] 페이지 네비게이션 중... ({type(nav_error).__name__})")
                 await asyncio.sleep(3)
 
             # 로그인 완료 대기
-            print("[...] 로그인 처리 중...")
+            log("[STEP 6] 로그인 처리 중... (3초 대기)")
             await asyncio.sleep(3)
 
             try:
+                log("[STEP 7] 페이지 로드 대기 중...")
                 await self.page.wait_for_load_state('networkidle', timeout=15000)
-            except:
-                pass  # 타임아웃 무시
+                log("[STEP 7] 페이지 로드 완료")
+            except Exception as e:
+                log(f"[STEP 7] 페이지 로드 타임아웃 ({type(e).__name__}), 계속 진행...")
 
             # 로그인 성공 확인
             current_url = self.page.url
-            print(f"[>] 로그인 후 URL: {current_url}")
+            log(f"[STEP 7] 로그인 후 URL: {current_url}")
 
+            log("[STEP 7] 페이지 콘텐츠 분석 중...")
             page_content = await self.page.content()
 
             # 로그인 성공 지표 확인
+            log("[STEP 7] 로그인 성공 지표 확인 중...")
             success_indicators = [
                 'logout' in page_content.lower(),
                 'sign out' in page_content.lower(),
@@ -322,26 +735,30 @@ class LimraSearchAgent:
                 'www.limra.com' in current_url and 'login' not in current_url.lower(),
             ]
 
+            log(f"[STEP 7] 성공 지표 확인 결과: {success_indicators}")
+
             if any(success_indicators):
                 self.is_logged_in = True
-                print("[OK] 로그인 성공!")
+                log("[SUCCESS] 로그인 성공!")
 
-                # 쿠키 저장 (세션 유지용)
-                cookies = await self.context.cookies()
-                cookies_path = self.download_folder / "session_cookies.json"
-                with open(cookies_path, 'w') as f:
-                    json.dump(cookies, f)
-                print(f"[COOKIE] 세션 쿠키 저장됨: {cookies_path}")
+                # 전체 세션 상태 저장 (쿠키 + localStorage)
+                storage_state = await self.context.storage_state()
+                session_path = self.download_folder / "limra_session.json"
+                with open(session_path, 'w') as f:
+                    json.dump(storage_state, f)
+                log(f"[SESSION] 세션 저장됨: {session_path}")
 
                 return True
             else:
+                log("[WARN] 로그인 지표를 찾지 못함, 메인 페이지에서 재확인...")
                 # 메인 페이지로 이동해서 다시 확인
-                print("[*] 메인 페이지에서 로그인 상태 확인 중...")
+                log("[STEP 8] 메인 페이지로 이동 중...")
                 await self.page.goto(self.BASE_URL, wait_until='networkidle', timeout=30000)
                 await asyncio.sleep(2)
 
                 page_content = await self.page.content()
                 current_url = self.page.url
+                log(f"[STEP 8] 메인 페이지 URL: {current_url}")
 
                 if any([
                     'logout' in page_content.lower(),
@@ -351,29 +768,48 @@ class LimraSearchAgent:
                     'limra.com' in current_url and 'login' not in current_url.lower(),
                 ]):
                     self.is_logged_in = True
-                    print("[OK] 로그인 성공!")
+                    log("[SUCCESS] 로그인 성공! (메인 페이지에서 확인)")
+
+                    # 세션 저장
+                    storage_state = await self.context.storage_state()
+                    session_path = self.download_folder / "limra_session.json"
+                    with open(session_path, 'w') as f:
+                        json.dump(storage_state, f)
+                    log(f"[SESSION] 세션 저장됨: {session_path}")
+
                     return True
 
                 # 추가 확인: 로그인 페이지가 아니면 로그인 성공으로 간주
                 if 'www.limra.com' in current_url and 'login' not in current_url.lower():
                     self.is_logged_in = True
-                    print("[OK] 로그인 성공! (메인 페이지 확인)")
+                    log("[SUCCESS] 로그인 성공! (URL 확인)")
+
+                    # 세션 저장
+                    storage_state = await self.context.storage_state()
+                    session_path = self.download_folder / "limra_session.json"
+                    with open(session_path, 'w') as f:
+                        json.dump(storage_state, f)
+                    log(f"[SESSION] 세션 저장됨: {session_path}")
+
                     return True
 
-                print("[ERROR] 로그인 실패 - 자격 증명을 확인해주세요")
+                log("[ERROR] 로그인 실패 - 자격 증명을 확인해주세요")
                 screenshot_path = self.download_folder / "login_failed_screenshot.png"
                 await self.page.screenshot(path=str(screenshot_path))
+                log(f"[SAVED] 실패 스크린샷: {screenshot_path}")
                 return False
 
         except Exception as e:
             # 오류가 발생해도 로그인 상태 확인
-            print(f"[WARN] 예외 발생: {e}")
-            print("[*] 로그인 상태 재확인 중...")
+            log(f"[EXCEPTION] 예외 발생: {type(e).__name__} - {str(e)}")
+            log("[*] 로그인 상태 재확인 중...")
 
             try:
+                log("[EXCEPTION] 2초 대기 후 메인 페이지로 이동...")
                 await asyncio.sleep(2)
                 await self.page.goto(self.BASE_URL, wait_until='networkidle', timeout=30000)
                 page_content = await self.page.content()
+                log(f"[EXCEPTION] 현재 URL: {self.page.url}")
 
                 if any([
                     'logout' in page_content.lower(),
@@ -381,17 +817,26 @@ class LimraSearchAgent:
                     'my limra' in page_content.lower(),
                 ]):
                     self.is_logged_in = True
-                    print("[OK] 로그인 성공!")
-                    return True
-            except:
-                pass
+                    log("[SUCCESS] 예외 발생 후 로그인 성공 확인!")
 
-            print("[ERROR] 로그인 실패")
+                    # 세션 저장
+                    storage_state = await self.context.storage_state()
+                    session_path = self.download_folder / "limra_session.json"
+                    with open(session_path, 'w') as f:
+                        json.dump(storage_state, f)
+                    log(f"[SESSION] 세션 저장됨: {session_path}")
+
+                    return True
+            except Exception as e2:
+                log(f"[EXCEPTION] 재확인 중 오류: {type(e2).__name__}")
+
+            log("[ERROR] 최종 로그인 실패")
             screenshot_path = self.download_folder / "login_error_screenshot.png"
             try:
                 await self.page.screenshot(path=str(screenshot_path))
-            except:
-                pass
+                log(f"[SAVED] 오류 스크린샷: {screenshot_path}")
+            except Exception as e3:
+                log(f"[ERROR] 스크린샷 저장 실패: {type(e3).__name__}")
             return False
 
     async def search_documents(self, query: str, max_results: int = 50) -> list:
@@ -707,8 +1152,8 @@ class LimraSearchAgent:
             print(f"[DATE] 기간: {end_year} 이전")
         print("-"*60)
 
-        # 1단계: 모든 문서 수집
-        all_documents = await self.browse_research_section()
+        # 1단계: 모든 문서 수집 (키워드 전달해서 필터링)
+        all_documents = await self.browse_research_section(keywords=keywords)
 
         # 2단계: 각 문서 페이지에서 날짜 정보 수집 (필요한 경우)
         if start_year or end_year:
@@ -824,14 +1269,19 @@ class LimraSearchAgent:
         start_year: int = None,
         end_year: int = None
     ) -> list:
-        """문서 목록 필터링"""
+        """문서 목록 필터링 - 키워드 매칭 없으면 전체 반환"""
         filtered = []
 
         for doc in documents:
-            # 키워드 필터링
+            # 키워드 필터링 (제목 + 설명 + 타입 + URL에서 검색)
             if keywords:
-                title_lower = doc['title'].lower()
-                keyword_match = any(kw.lower() in title_lower for kw in keywords)
+                title_lower = doc.get('title', '').lower()
+                desc_lower = doc.get('description', '').lower()
+                type_lower = doc.get('type', '').lower()
+                url_lower = doc.get('url', '').lower()
+                search_text = f"{title_lower} {desc_lower} {type_lower} {url_lower}"
+
+                keyword_match = any(kw.lower() in search_text for kw in keywords)
                 if not keyword_match:
                     continue
 
@@ -842,153 +1292,120 @@ class LimraSearchAgent:
                     continue
                 if end_year and doc_year > end_year:
                     continue
-            elif start_year or end_year:
-                # 연도 정보가 없으면 제외할지 포함할지 선택
-                # 여기서는 연도 정보가 없어도 포함 (키워드가 맞으면)
-                pass
+            # 연도 정보가 없는 문서는 포함 (최신 문서일 가능성)
 
             filtered.append(doc)
 
+        # 키워드 필터링 후 결과가 없으면 연도 필터만 적용
+        if keywords and not filtered and documents:
+            print(f"[WARN] 키워드 매칭 결과 없음. 연도 필터만 적용합니다.")
+            for doc in documents:
+                doc_year = doc.get('year')
+                if doc_year:
+                    if start_year and doc_year < start_year:
+                        continue
+                    if end_year and doc_year > end_year:
+                        continue
+                filtered.append(doc)
+
         return filtered
 
-    async def browse_research_section(self) -> list:
-        """연구 섹션 탐색하여 실제 문서/보고서 목록 수집"""
-        print("\n[DOC] 연구 섹션 탐색 중...")
+    async def browse_research_section(
+        self,
+        keywords: list = None,
+        start_year: int = None,
+        end_year: int = None
+    ) -> list:
+        """
+        연구 섹션 탐색하여 실제 문서/보고서 목록 수집 (간소화 버전)
+
+        Args:
+            keywords: 검색 키워드 리스트 (옵션)
+            start_year: 시작 연도 (옵션)
+            end_year: 종료 연도 (옵션)
+
+        Returns:
+            문서 목록
+        """
+        print("\n[DOC] 연구 섹션 탐색 중 (간소화 방식)...")
+        if keywords:
+            print(f"[KEYWORDS] {', '.join(keywords)}")
 
         all_documents = []
 
         for research_url in self.RESEARCH_URLS:
             try:
                 print(f"  → {research_url}")
-                await self.page.goto(research_url, wait_until='networkidle', timeout=30000)
-                await asyncio.sleep(2)
+                await self.page.goto(research_url, wait_until='domcontentloaded', timeout=20000)
+                await asyncio.sleep(1)
 
-                # 실제 문서/보고서 카드/아이템 찾기
-                # LIMRA 사이트의 연구 목록 구조에 맞게 셀렉터 지정
-                article_selectors = [
-                    '.research-item',
-                    '.article-item',
-                    '.card',
-                    '.list-item',
-                    'article',
-                    '[class*="research"]',
-                    '[class*="article"]',
-                    '[class*="report"]',
-                    '.content-item',
-                    '.publication-item',
-                ]
+                # 간소화: 모든 링크를 수집하고 PDF/문서 링크만 필터링
+                print(f"    [LINK] 모든 링크 수집 중...")
+                links = await self.page.query_selector_all('a[href]')
+                print(f"    [LINK] 총 {len(links)}개 링크 발견")
 
-                found_articles = []
-                for selector in article_selectors:
-                    items = await self.page.query_selector_all(selector)
-                    if items and len(items) > 0:
-                        found_articles = items
-                        print(f"    [LIST] {len(items)}개 항목 발견 ({selector})")
-                        break
+                extracted = 0
+                skipped = 0
 
-                # 각 아티클에서 링크와 제목 추출
-                for item in found_articles:
+                for link in links:
                     try:
-                        # 제목 링크 찾기
-                        title_link = await item.query_selector('a[href]')
-                        if not title_link:
-                            continue
+                        href = await link.get_attribute('href')
+                        text = (await link.inner_text()).strip()
 
-                        href = await title_link.get_attribute('href')
-                        text = await title_link.inner_text()
-
-                        if not href or not text.strip():
+                        if not href or not text:
+                            skipped += 1
                             continue
 
                         full_url = urljoin(self.BASE_URL, href)
+                        url_lower = full_url.lower()
 
-                        # 제외할 링크 패턴 (일반 페이지, 언어 설정 등)
+                        # PDF 직접 링크는 무조건 포함
+                        if '.pdf' in url_lower:
+                            all_documents.append({
+                                'title': text or 'PDF Document',
+                                'url': full_url,
+                                'type': 'PDF',
+                                'description': ''
+                            })
+                            extracted += 1
+                            continue
+
+                        # 제외 패턴
                         skip_patterns = [
-                            '?epslanguage=',
-                            '/en/research/?',
-                            '/login',
-                            '/search',
-                            '#',
-                            'javascript:',
-                            '/en/research/insurance/?',
-                            '/en/research/retirement/?',
-                            '/en/research/annuities/?',
-                            '/en/research/workplace-benefits/?',
+                            '?epslanguage=', '/login', '/search', '#', 'javascript:',
+                            '/en/research/?', '/en/research/insurance/?',
+                            '/en/research/retirement/?', '/en/research/annuities/?',
+                            '/en/research/workplace-benefits/?'
                         ]
-
-                        if any(pattern in full_url for pattern in skip_patterns):
+                        if any(p in full_url for p in skip_patterns):
+                            skipped += 1
                             continue
 
-                        # 너무 짧은 제목 제외 (네비게이션 링크일 가능성)
-                        if len(text.strip()) < 10:
-                            continue
+                        # 문서 페이지: URL 깊이 3 이상 + 제목 15자 이상
+                        path_segments = [s for s in urlparse(full_url).path.split('/') if s]
+                        if len(path_segments) >= 3 and len(text) >= 15:
+                            all_documents.append({
+                                'title': text,
+                                'url': full_url,
+                                'type': 'Article',
+                                'description': ''
+                            })
+                            extracted += 1
+                        else:
+                            skipped += 1
 
-                        all_documents.append({
-                            'title': text.strip(),
-                            'url': full_url,
-                            'type': self._get_document_type(href),
-                            'description': ''
-                        })
                     except:
+                        skipped += 1
                         continue
 
-                # 카드/아이템이 없으면 일반 링크에서 추출 (더 엄격한 필터링)
-                if not found_articles:
-                    links = await self.page.query_selector_all('a[href]')
-                    for link in links:
-                        try:
-                            href = await link.get_attribute('href')
-                            text = await link.inner_text()
-
-                            if not href or not text.strip():
-                                continue
-
-                            full_url = urljoin(self.BASE_URL, href)
-
-                            # 실제 문서 페이지인지 확인 (더 구체적인 URL 패턴)
-                            # 예: /en/research/research-reports/report-name/
-                            url_lower = full_url.lower()
-
-                            # PDF 직접 링크
-                            if '.pdf' in url_lower:
-                                all_documents.append({
-                                    'title': text.strip() or 'PDF Document',
-                                    'url': full_url,
-                                    'type': 'PDF',
-                                    'description': ''
-                                })
-                                continue
-
-                            # 구체적인 문서 페이지 패턴 (URL에 여러 경로 세그먼트가 있어야 함)
-                            path_segments = [s for s in urlparse(full_url).path.split('/') if s]
-                            if len(path_segments) >= 3:  # 예: /en/research/report-title/
-                                # 제외 패턴 확인
-                                skip_patterns = [
-                                    '?epslanguage=',
-                                    '/login',
-                                    '/search',
-                                    '#',
-                                    'javascript:',
-                                ]
-                                if any(pattern in full_url for pattern in skip_patterns):
-                                    continue
-
-                                # 짧은 제목 제외
-                                if len(text.strip()) < 15:
-                                    continue
-
-                                all_documents.append({
-                                    'title': text.strip(),
-                                    'url': full_url,
-                                    'type': 'Article',
-                                    'description': ''
-                                })
-                        except:
-                            continue
+                print(f"    [LINK] 추출: {extracted}개, 제외: {skipped}개")
+                print(f"    [TOTAL] 누적 문서: {len(all_documents)}개")
 
             except Exception as e:
                 print(f"  [WARN] 오류: {e}")
                 continue
+
+        print(f"\n[DEBUG] 전체 수집된 문서 수: {len(all_documents)}개 (중복 포함)")
 
         # 중복 제거
         seen = set()
@@ -998,6 +1415,40 @@ class LimraSearchAgent:
                 seen.add(doc['url'])
                 seen.add(doc['title'])
                 unique_docs.append(doc)
+
+        print(f"[DEBUG] 중복 제거 후: {len(unique_docs)}개")
+
+        # 샘플 문서 제목 출력 (디버깅용)
+        print(f"[DEBUG] 샘플 문서 제목 (처음 10개):")
+        for i, doc in enumerate(unique_docs[:10], 1):
+            print(f"    {i}. {doc['title'][:80]}")
+
+        # 키워드 필터링
+        if keywords:
+            print(f"[FILTER] 키워드 필터링 중: {', '.join(keywords)}")
+            filtered_docs = []
+            for doc in unique_docs:
+                title_lower = doc['title'].lower()
+                desc_lower = doc.get('description', '').lower()
+                url_lower = doc.get('url', '').lower()
+
+                # 키워드 중 하나라도 제목, 설명, 또는 URL에 포함되면 선택
+                for keyword in keywords:
+                    keyword_lower = keyword.lower()
+                    if keyword_lower in title_lower or keyword_lower in desc_lower or keyword_lower in url_lower:
+                        filtered_docs.append(doc)
+                        print(f"    [MATCH] {doc['title'][:60]}")
+                        break
+
+            print(f"[FILTER] 키워드 필터링 후: {len(filtered_docs)}개")
+
+            # 필터링 결과가 없으면 전체 문서 반환 (경고 출력)
+            if not filtered_docs:
+                print(f"[WARN] 키워드 '{', '.join(keywords)}'와 일치하는 문서가 없습니다.")
+                print(f"[WARN] 전체 문서 {len(unique_docs)}개를 반환합니다.")
+                filtered_docs = unique_docs
+
+            unique_docs = filtered_docs
 
         print(f"[OK] 총 {len(unique_docs)}개 실제 문서 발견")
         return unique_docs
@@ -1106,16 +1557,61 @@ class LimraSearchAgent:
                 except Exception as e:
                     print(f"[WARN] PDF URL 다운로드 실패: {e}")
 
-            # 다운로드 링크를 찾지 못한 경우 - 페이지 PDF로 저장 (폴백)
-            print(f"[WARN] 다운로드 링크 없음, 페이지 PDF로 저장")
-            if filepath.suffix != '.pdf':
-                filepath = filepath.with_suffix('.pdf')
+            # 다운로드 링크를 찾지 못한 경우
+            # headless=False에서는 page.pdf()가 작동하지 않음
+            # requests로 직접 다운로드 시도
+            print(f"[WARN] 다운로드 링크 없음, requests로 직접 다운로드 시도")
 
-            await self._dismiss_cookie_banner()
-            await self.page.pdf(path=str(filepath))
+            try:
+                # 브라우저 쿠키를 requests 세션으로 복사
+                cookies = await self.context.cookies()
+                session = requests.Session()
+                for cookie in cookies:
+                    session.cookies.set(cookie['name'], cookie['value'], domain=cookie.get('domain', ''))
 
-            print(f"[OK] 페이지 캡처 저장됨: {filepath}")
-            return str(filepath)
+                # User-Agent 설정
+                session.headers.update({
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                })
+
+                # PDF 다운로드 시도 (URL에 .pdf가 있거나 Content-Type이 PDF인 경우)
+                response = session.get(url, stream=True, timeout=60)
+
+                content_type = response.headers.get('Content-Type', '')
+
+                if 'application/pdf' in content_type or url.endswith('.pdf'):
+                    # PDF 파일인 경우 저장
+                    if filepath.suffix != '.pdf':
+                        filepath = filepath.with_suffix('.pdf')
+
+                    with open(filepath, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+
+                    print(f"[OK] requests로 PDF 저장됨: {filepath}")
+                    return str(filepath)
+                else:
+                    # PDF가 아닌 경우 - HTML 페이지를 텍스트로 저장
+                    print(f"[INFO] PDF가 아님 (Content-Type: {content_type}), 건너뜀")
+                    return None
+
+            except Exception as e:
+                print(f"[WARN] requests 다운로드 실패: {e}")
+
+            # headless 모드에서만 page.pdf() 시도
+            if self.headless:
+                try:
+                    if filepath.suffix != '.pdf':
+                        filepath = filepath.with_suffix('.pdf')
+                    await self._dismiss_cookie_banner()
+                    await self.page.pdf(path=str(filepath))
+                    print(f"[OK] 페이지 캡처 저장됨: {filepath}")
+                    return str(filepath)
+                except Exception as e:
+                    print(f"[WARN] page.pdf() 실패 (headless 모드에서만 작동): {e}")
+
+            print(f"[SKIP] 다운로드 불가: {url}")
+            return None
 
         except Exception as e:
             print(f"[ERROR] 다운로드 실패: {e}")
@@ -1256,6 +1752,255 @@ class LimraSearchAgent:
 
         print(f"[REPORT] 검색 리포트 저장됨: {report_path}")
         return report_path
+
+    async def ai_smart_search(
+        self,
+        keyword: str,
+        ai_helper=None,
+        max_pages: int = 20
+    ) -> list:
+        """
+        AI 기반 스마트 검색 - Research 탭에서 키워드로 검색 → PDF 다운로드 → AI 분석 → Word 저장
+
+        Args:
+            keyword: 검색 키워드
+            ai_helper: AI 헬퍼 인스턴스 (필수)
+            max_pages: 다운로드할 최대 문서 수
+
+        Returns:
+            생성된 보고서 정보
+        """
+        print("\n" + "="*60)
+        print(f"[AI SEARCH] Research 탭 검색 및 AI 분석: '{keyword}'")
+        print("="*60)
+
+        if not ai_helper:
+            print("[ERROR] AI 헬퍼가 필요합니다.")
+            return []
+
+        try:
+            # 1. LIMRA 검색 기능으로 키워드 검색
+            print(f"\n[STEP 1] LIMRA 사이트에서 '{keyword}' 검색 중...")
+            docs = await self.search_documents(query=keyword, max_results=max_pages)
+
+            if not docs:
+                print(f"[WARN] '{keyword}' 키워드로 검색된 문서가 없습니다.")
+                return []
+
+            print(f"[OK] {len(docs)}개 문서 발견")
+
+            # 최대 다운로드 수 제한
+            docs_to_download = docs[:max_pages]
+            print(f"[INFO] {len(docs_to_download)}개 문서 다운로드 시작...")
+
+            # 2. 검색된 모든 PDF 다운로드
+            print(f"\n[STEP 2] PDF 문서 다운로드 중...")
+            self.search_results = docs_to_download
+            downloaded_files = await self.download_all_results()
+
+            if not downloaded_files:
+                print("[ERROR] 다운로드된 파일이 없습니다.")
+                return []
+
+            print(f"[OK] {len(downloaded_files)}개 PDF 다운로드 완료")
+
+            # 3. 다운로드한 모든 PDF를 AI가 읽고 분석
+            print(f"\n[STEP 3] AI가 PDF 파일들을 분석 중...")
+
+            # PyPDF2로 PDF 텍스트 추출
+            try:
+                import PyPDF2
+            except ImportError:
+                print("[ERROR] PyPDF2가 설치되지 않았습니다. pip install PyPDF2")
+                return []
+
+            all_pdf_content = []
+            for pdf_file in downloaded_files:
+                try:
+                    pdf_path = pdf_file['filepath']  # filepath 키 사용
+                    print(f"  읽는 중: {pdf_file['title'][:50]}...")
+
+                    with open(pdf_path, 'rb') as f:
+                        pdf_reader = PyPDF2.PdfReader(f)
+                        text_content = ""
+
+                        # 모든 페이지 읽기
+                        for page_num, page in enumerate(pdf_reader.pages):
+                            try:
+                                text_content += page.extract_text() + "\n"
+                            except:
+                                continue
+
+                        if text_content.strip():
+                            all_pdf_content.append({
+                                'title': pdf_file['title'],
+                                'filepath': str(pdf_path),
+                                'content': text_content[:10000]  # 첫 10000자만
+                            })
+                            print(f"    ✓ {len(text_content)} 글자 추출")
+
+                except Exception as e:
+                    print(f"    ✗ PDF 읽기 실패: {e}")
+                    continue
+
+            if not all_pdf_content:
+                print("[ERROR] PDF에서 텍스트를 추출할 수 없습니다.")
+                return []
+
+            print(f"[OK] {len(all_pdf_content)}개 PDF 분석 완료")
+
+            # 4. AI가 모든 문서를 읽고 종합 보고서 작성
+            print(f"\n[STEP 4] AI가 종합 보고서 작성 중...")
+
+            # 모든 PDF 내용을 하나로 결합
+            combined_text = f"검색 키워드: {keyword}\n\n"
+            combined_text += f"총 {len(all_pdf_content)}개 문서 분석\n\n"
+
+            for i, doc in enumerate(all_pdf_content, 1):
+                combined_text += f"\n{'='*60}\n"
+                combined_text += f"문서 {i}: {doc['title']}\n"
+                combined_text += f"파일: {doc['filepath']}\n"
+                combined_text += f"{'='*60}\n"
+                combined_text += doc['content'][:5000] + "\n\n"
+
+            # AI 프롬프트
+            prompt = f"""당신은 보험 산업 리서치 분석가입니다. 다음은 LIMRA Research 섹션에서 '{keyword}' 키워드로 검색한 {len(all_pdf_content)}개의 PDF 문서 내용입니다.
+
+{combined_text[:50000]}
+
+위 문서들을 종합 분석하여 다음 형식으로 상세한 한국어 보고서를 작성해주세요:
+
+# {keyword} - LIMRA Research 종합 분석 보고서
+
+## 1. 요약 (Executive Summary)
+전체 문서의 핵심 내용을 3-5문단으로 요약
+
+## 2. 주요 발견사항 (Key Findings)
+- 각 문서에서 발견된 중요한 인사이트
+- 데이터, 통계, 트렌드
+- 산업에 대한 시사점
+
+## 3. 상세 분석 (Detailed Analysis)
+각 문서별로:
+- 문서 제목
+- 핵심 내용
+- 주요 데이터 포인트
+- 분석 및 해석
+
+## 4. 결론 및 권장사항 (Conclusions & Recommendations)
+- 전체 문서를 통해 얻은 통찰
+- 비즈니스 의사결정을 위한 권장사항
+- 향후 고려사항
+
+## 5. 참고 문헌 (References)
+분석한 모든 문서 목록
+
+보고서는 전문적이고 상세하게 작성해주세요."""
+
+            # Groq AI 호출
+            from groq import Groq
+            client = Groq(api_key=ai_helper.api_key)
+
+            response = client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model=ai_helper.model,
+                temperature=0.3,
+                max_tokens=6000
+            )
+
+            report = response.choices[0].message.content
+            print(f"[OK] AI 보고서 생성 완료 ({len(report)} 글자)")
+
+            # 5. Word 문서로 저장
+            print(f"\n[STEP 5] Word 문서(.docx)로 저장 중...")
+
+            try:
+                from docx import Document
+                from docx.shared import Pt, RGBColor, Inches
+                from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+
+                # Word 문서 생성
+                doc = Document()
+
+                # 제목 추가
+                title = doc.add_heading(f'{keyword} - LIMRA Research 종합 분석 보고서', 0)
+                title.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+
+                # 메타데이터
+                meta = doc.add_paragraph()
+                meta.add_run(f'생성일: {datetime.now().strftime("%Y년 %m월 %d일")}\n')
+                meta.add_run(f'분석 문서 수: {len(all_pdf_content)}개\n')
+                meta.add_run(f'키워드: {keyword}\n')
+                meta.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+
+                doc.add_paragraph('_' * 50)
+
+                # 보고서 내용 추가
+                for line in report.split('\n'):
+                    if line.startswith('# '):
+                        # 대제목
+                        doc.add_heading(line.replace('# ', ''), 1)
+                    elif line.startswith('## '):
+                        # 중제목
+                        doc.add_heading(line.replace('## ', ''), 2)
+                    elif line.startswith('### '):
+                        # 소제목
+                        doc.add_heading(line.replace('### ', ''), 3)
+                    elif line.strip().startswith('- ') or line.strip().startswith('* '):
+                        # 리스트
+                        doc.add_paragraph(line.strip()[2:], style='List Bullet')
+                    elif line.strip():
+                        # 일반 텍스트
+                        doc.add_paragraph(line)
+
+                # 파일명 생성
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                filename = f"LIMRA_AI_Report_{keyword.replace(' ', '_')}_{timestamp}.docx"
+                filepath = self.download_folder / filename
+
+                doc.save(str(filepath))
+                print(f"[OK] Word 문서 저장 완료: {filename}")
+
+                return [{
+                    'title': f'{keyword} AI 종합 분석 보고서',
+                    'url': 'AI Generated',
+                    'type': 'AI Report (Word)',
+                    'file': filename,
+                    'pdf_count': len(all_pdf_content),
+                    'downloaded_files': [f['filepath'] for f in downloaded_files]
+                }]
+
+            except ImportError:
+                print("[WARN] python-docx가 설치되지 않았습니다. 텍스트 파일로 저장합니다.")
+
+                # Word 라이브러리 없으면 TXT로 저장
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                filename = f"LIMRA_AI_Report_{keyword.replace(' ', '_')}_{timestamp}.txt"
+                filepath = self.download_folder / filename
+
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write(f"{keyword} - LIMRA Research 종합 분석 보고서\n")
+                    f.write(f"생성일: {datetime.now().strftime('%Y년 %m월 %d일')}\n")
+                    f.write(f"분석 문서 수: {len(all_pdf_content)}개\n\n")
+                    f.write("="*60 + "\n\n")
+                    f.write(report)
+
+                print(f"[OK] 텍스트 파일 저장 완료: {filename}")
+
+                return [{
+                    'title': f'{keyword} AI 종합 분석 보고서',
+                    'url': 'AI Generated',
+                    'type': 'AI Report (TXT)',
+                    'file': filename,
+                    'pdf_count': len(all_pdf_content),
+                    'downloaded_files': [f['filepath'] for f in downloaded_files]
+                }]
+
+        except Exception as e:
+            print(f"[ERROR] AI 스마트 검색 실패: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
 
     async def close(self):
         """브라우저 종료"""
@@ -1426,9 +2171,6 @@ async def main():
         print(f"\n[ERROR] 오류 발생: {e}")
         import traceback
         traceback.print_exc()
-
-    finally:
-        await agent.close()
 
 
 if __name__ == "__main__":
