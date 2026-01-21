@@ -5,6 +5,8 @@ LIMRA 문서 검색 및 다운로드 에이전트
 """
 
 import asyncio
+import nest_asyncio
+nest_asyncio.apply()  # 중첩 이벤트 루프 허용
 import os
 import re
 import json

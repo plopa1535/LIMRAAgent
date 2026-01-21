@@ -1,9 +1,11 @@
 """
 LIMRA 문서 검색 에이전트 - 웹 인터페이스
-Flask 기반 웹 UI
+Flask 기반 웹 UI + 멀티스레드 서브에이전트 시스템
 """
 
 import asyncio
+import nest_asyncio
+nest_asyncio.apply()  # 중첩 이벤트 루프 허용
 import json
 import os
 import threading
@@ -12,6 +14,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from limra_search_agent import LimraSearchAgent
+from sub_agents import AgentManager, SharedState
 
 # AI 기능 임포트 (선택적)
 try:
@@ -24,12 +27,17 @@ except ImportError:
 app = Flask(__name__, template_folder='templates', static_folder='static')
 
 # 비동기 작업 실행을 위한 ThreadPoolExecutor
-executor = ThreadPoolExecutor(max_workers=1)
+executor = ThreadPoolExecutor(max_workers=3)
 
 # 전역 에이전트 및 상태
 agent = None
 agent_loop = None  # 에이전트 전용 이벤트 루프
 ai_helper = None  # AI 도우미
+
+# 서브에이전트 매니저
+agent_manager: AgentManager = None
+
+# 기존 호환성을 위한 agent_status (agent_manager와 동기화됨)
 agent_status = {
     'logged_in': False,
     'message': '',
@@ -81,10 +89,22 @@ def get_or_create_loop():
 
 
 def run_async(coro):
-    """비동기 함수를 동기적으로 실행 (동일한 루프 재사용)"""
-    loop = get_or_create_loop()
-    asyncio.set_event_loop(loop)
-    return loop.run_until_complete(coro)
+    """비동기 함수를 동기적으로 실행 - 동일한 루프 재사용 (Playwright 호환)"""
+    global agent_loop
+    try:
+        # 에이전트 전용 루프 사용 (Playwright 객체 유지를 위해)
+        if agent_loop is None or agent_loop.is_closed():
+            agent_loop = asyncio.new_event_loop()
+            print(f"[ASYNC] 새 이벤트 루프 생성", flush=True)
+
+        asyncio.set_event_loop(agent_loop)
+        # nest_asyncio가 적용되어 있으므로 run_until_complete 호출 가능
+        return agent_loop.run_until_complete(coro)
+    except Exception as e:
+        print(f"[ASYNC ERROR] {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 @app.route('/')
@@ -96,16 +116,25 @@ def index():
 @app.route('/api/login', methods=['POST'])
 def api_login():
     """로그인 API"""
-    global agent, agent_status
+    global agent, agent_status, agent_manager
 
-    data = request.json
+    print("[API] /api/login 호출됨", flush=True)
+
+    data = request.json or {}
     email = data.get('email', 'plopa1535@kyobo.com')
     password = data.get('password', 'Kyobo1234!@#$')
 
+    print(f"[API] 로그인 시작: {email}", flush=True)
+
     def do_login_sync():
-        global agent, agent_status
+        global agent, agent_status, agent_manager
+        print("[LOGIN THREAD] do_login_sync 시작", flush=True)
         agent_status['is_running'] = True
         agent_status['message'] = '로그인 중...'
+
+        # 서브에이전트 상태 업데이트
+        if agent_manager:
+            agent_manager.update_state(is_running=True, message='로그인 중...', browser_status='opening')
 
         import sys
 
@@ -125,6 +154,12 @@ def api_login():
                 )
                 print("[WEB] 브라우저 초기화 중...", flush=True)
                 await agent.initialize()
+
+                # 서브에이전트에 브라우저 참조 설정
+                if agent_manager and agent.browser and agent.context and agent.page:
+                    agent_manager.set_browser_refs(agent.browser, agent.context, agent.page)
+                    print("[WEB] 서브에이전트에 브라우저 참조 설정 완료", flush=True)
+
                 print("[WEB] 로그인 실행 중...", flush=True)
                 success = await agent.login()
                 print(f"[WEB] 로그인 결과: {success}", flush=True)
@@ -135,15 +170,22 @@ def api_login():
             if success:
                 agent_status['logged_in'] = True
                 agent_status['message'] = '로그인 성공!'
+                if agent_manager:
+                    agent_manager.update_state(logged_in=True, message='로그인 성공!', browser_status='ready')
                 print("[WEB] 로그인 성공! 상태 업데이트 완료", flush=True)
             else:
                 agent_status['message'] = '로그인 실패'
+                if agent_manager:
+                    agent_manager.update_state(message='로그인 실패', browser_status='error')
                 print("[WEB] 로그인 실패", flush=True)
 
             return success
 
         except Exception as e:
             agent_status['message'] = f'오류: {str(e)}'
+            if agent_manager:
+                agent_manager.update_state(message=f'오류: {str(e)}', browser_status='error')
+                agent_manager.shared_state.add_error(f'Login error: {str(e)}')
             print(f"[WEB ERROR] {type(e).__name__}: {str(e)}", flush=True)
             import traceback
             traceback.print_exc()
@@ -151,6 +193,8 @@ def api_login():
 
         finally:
             agent_status['is_running'] = False
+            if agent_manager:
+                agent_manager.update_state(is_running=False)
             print("[WEB] 로그인 프로세스 종료\n", flush=True)
 
     # 백그라운드 스레드에서 로그인 실행
@@ -258,13 +302,54 @@ def api_search():
 
         try:
             async def do_search():
-                results = await agent.browse_research_with_filter(
+                all_results = []
+                seen_urls = set()
+
+                # 1단계: LIMRA 검색 API 사용 (키워드가 있는 경우)
+                if keywords:
+                    agent_status['message'] = f'LIMRA 검색 중: {", ".join(keywords)}...'
+                    print(f"\n[SEARCH] LIMRA 검색 API 사용: {keywords}", flush=True)
+
+                    for kw in keywords:
+                        try:
+                            search_results = await agent.search_documents(query=kw, max_results=50)
+                            print(f"[SEARCH] '{kw}' 검색 결과: {len(search_results)}개", flush=True)
+
+                            for doc in search_results:
+                                url = doc.get('url', '')
+                                if url and url not in seen_urls:
+                                    seen_urls.add(url)
+                                    all_results.append(doc)
+                        except Exception as e:
+                            print(f"[SEARCH] 검색 오류: {e}", flush=True)
+
+                # 2단계: Research 섹션 탐색 (추가 문서 수집)
+                agent_status['message'] = 'Research 섹션 탐색 중...'
+                print(f"\n[SEARCH] Research 섹션 탐색 시작", flush=True)
+
+                browse_results = await agent.browse_research_with_filter(
                     keywords=keywords if keywords else None,
                     start_year=start_year,
                     end_year=end_year,
-                    auto_download=auto_download
+                    auto_download=False  # 다운로드는 별도로 처리
                 )
-                return results
+
+                # 중복 제거하며 병합
+                for doc in browse_results:
+                    url = doc.get('url', '')
+                    if url and url not in seen_urls:
+                        seen_urls.add(url)
+                        all_results.append(doc)
+
+                print(f"[SEARCH] 총 {len(all_results)}개 문서 발견 (중복 제거)", flush=True)
+
+                # 자동 다운로드 처리
+                if auto_download and all_results:
+                    agent_status['message'] = f'{len(all_results)}개 문서 다운로드 중...'
+                    agent.search_results = all_results
+                    await agent.download_all_results()
+
+                return all_results
 
             results = run_async(do_search())
 
@@ -311,27 +396,49 @@ def api_download():
         return jsonify({'success': False, 'message': '다운로드할 문서가 없습니다.'})
 
     def do_download_sync():
-        global agent_status
+        global agent_status, agent_manager
         agent_status['is_running'] = True
         agent_status['message'] = f'{len(documents)}개 문서 다운로드 중...'
 
+        print(f"\n[DOWNLOAD] 다운로드 시작: {len(documents)}개 문서", flush=True)
+
+        if agent_manager:
+            agent_manager.update_state(is_running=True, message=f'{len(documents)}개 문서 다운로드 중...')
+
         try:
             async def do_download():
+                print(f"[DOWNLOAD] search_results 설정: {len(documents)}개", flush=True)
                 agent.search_results = documents
+                print("[DOWNLOAD] download_all_results 호출...", flush=True)
                 downloaded = await agent.download_all_results()
+                print(f"[DOWNLOAD] 다운로드 완료: {len(downloaded) if downloaded else 0}개", flush=True)
                 return downloaded
 
             downloaded = run_async(do_download())
 
-            agent_status['message'] = f'{len(downloaded)}개 파일 다운로드 완료'
+            msg = f'{len(downloaded) if downloaded else 0}개 파일 다운로드 완료'
+            agent_status['message'] = msg
+            if agent_manager:
+                agent_manager.update_state(message=msg)
+            print(f"[DOWNLOAD] {msg}", flush=True)
             return downloaded
 
         except Exception as e:
-            agent_status['message'] = f'오류: {str(e)}'
+            import traceback
+            error_msg = f'다운로드 오류: {str(e)}'
+            agent_status['message'] = error_msg
+            if agent_manager:
+                agent_manager.update_state(message=error_msg)
+                agent_manager.shared_state.add_error(f'Download error: {str(e)}')
+            print(f"[DOWNLOAD ERROR] {error_msg}", flush=True)
+            traceback.print_exc()
             return None
 
         finally:
             agent_status['is_running'] = False
+            if agent_manager:
+                agent_manager.update_state(is_running=False)
+            print("[DOWNLOAD] 다운로드 프로세스 종료\n", flush=True)
 
     # 백그라운드 스레드에서 다운로드 실행
     executor.submit(do_download_sync)
@@ -347,13 +454,23 @@ def api_download():
 @app.route('/api/status')
 def api_status():
     """상태 확인 API"""
+    global agent_manager
+
+    # 서브에이전트 매니저가 있으면 통합 상태 반환
+    if agent_manager:
+        status = agent_manager.get_status()
+        # 기존 agent_status와 병합 (results는 기존 것 유지)
+        status['results'] = agent_status.get('results', [])
+        status['ai_enabled'] = agent_status.get('ai_enabled', False)
+        return jsonify(status)
+
     return jsonify(agent_status)
 
 
 @app.route('/api/logout', methods=['POST'])
 def api_logout():
     """로그아웃 API"""
-    global agent, agent_status, agent_loop
+    global agent, agent_status, agent_loop, agent_manager
 
     try:
         if agent:
@@ -363,6 +480,11 @@ def api_logout():
         agent_status['logged_in'] = False
         agent_status['message'] = '로그아웃됨'
         agent_status['results'] = []
+
+        # 서브에이전트 브라우저 참조 클리어
+        if agent_manager:
+            agent_manager.clear_browser_refs()
+            agent_manager.update_state(logged_in=False, message='로그아웃됨', browser_status='closed')
 
         # 이벤트 루프 정리
         if agent_loop and not agent_loop.is_closed():
@@ -379,6 +501,49 @@ def api_logout():
 def download_file(filename):
     """다운로드 파일 제공"""
     return send_from_directory(DOWNLOAD_FOLDER, filename)
+
+
+@app.route('/api/agents')
+def api_agents():
+    """서브에이전트 상태 확인 API"""
+    global agent_manager
+
+    if not agent_manager:
+        return jsonify({'error': 'Agent manager not initialized'})
+
+    agents_info = {
+        'manager': 'running',
+        'agents': {
+            'BrowserController': {
+                'running': agent_manager.browser_agent._running,
+                'interval': agent_manager.browser_agent.get_interval(),
+                'browser_status': agent_manager.shared_state.get('browser_status'),
+                'has_page': agent_manager.browser_agent.page is not None,
+                'last_check': str(agent_manager.browser_agent.last_check) if agent_manager.browser_agent.last_check else None
+            },
+            'SessionManager': {
+                'running': agent_manager.session_agent._running,
+                'interval': agent_manager.session_agent.get_interval(),
+                'has_context': agent_manager.session_agent.context is not None,
+                'last_check': str(agent_manager.session_agent.last_session_check) if agent_manager.session_agent.last_session_check else None
+            },
+            'DownloadManager': {
+                'running': agent_manager.download_agent._running,
+                'interval': agent_manager.download_agent.get_interval(),
+                'queue_size': len(agent_manager.shared_state.get('download_queue', [])),
+                'download_folder': str(agent_manager.download_agent.download_folder)
+            },
+            'UISync': {
+                'running': agent_manager.ui_agent._running,
+                'interval': agent_manager.ui_agent.get_interval(),
+                'callbacks_count': len(agent_manager.ui_agent._callbacks)
+            }
+        },
+        'shared_state': agent_manager.shared_state.get_all(),
+        'errors': agent_manager.shared_state.get('errors', [])[-10:]  # 최근 10개 에러
+    }
+
+    return jsonify(agents_info)
 
 
 @app.route('/api/files')
@@ -651,10 +816,43 @@ def api_ai_generate_report():
     })
 
 
+def init_agent_manager():
+    """서브에이전트 매니저 초기화"""
+    global agent_manager
+    agent_manager = AgentManager(DOWNLOAD_FOLDER)
+    # 참고: 서브에이전트는 Playwright와 이벤트 루프 충돌을 피하기 위해 시작하지 않음
+    # 상태 관리는 agent_manager.shared_state를 통해 수동으로 처리
+    print("[SYSTEM] Sub-agents manager initialized")
+
+    # 상태 변경 리스너 추가 (agent_status 동기화)
+    def sync_status(key, value):
+        global agent_status
+        if key in agent_status:
+            agent_status[key] = value
+
+    agent_manager.shared_state.add_listener(sync_status)
+
+
+def shutdown_agent_manager():
+    """서브에이전트 매니저 종료"""
+    global agent_manager
+    if agent_manager:
+        agent_manager.stop_all()
+        print("[SYSTEM] Sub-agents stopped")
+
+
 if __name__ == '__main__':
     print("=" * 50)
     print("LIMRA 문서 검색 에이전트 - 웹 UI")
     print("=" * 50)
+
+    # 서브에이전트 매니저 초기화
+    init_agent_manager()
+
     print("\n브라우저에서 http://localhost:5000 접속하세요\n")
-    # debug=False로 설정하여 watchdog 재시작 방지 (다운로드 안정성 향상)
-    app.run(debug=False, port=5000, threaded=True)
+
+    try:
+        # debug=False로 설정하여 watchdog 재시작 방지 (다운로드 안정성 향상)
+        app.run(debug=False, port=5000, threaded=True)
+    finally:
+        shutdown_agent_manager()

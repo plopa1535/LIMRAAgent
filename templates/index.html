@@ -893,53 +893,55 @@
         // 검색 상태 폴링
         async function pollSearchStatus(autoDownload) {
             const btn = document.getElementById('searchBtn');
-            const maxAttempts = 300; // 최대 5분
-            let attempts = 0;
+            const maxIdleAttempts = 10; // is_running=false 상태에서 최대 대기 (결과 없을 때)
+            let idleAttempts = 0;
             let lastMessage = '';
 
             const interval = setInterval(async () => {
-                attempts++;
                 try {
                     const response = await fetch('/api/status');
                     const status = await response.json();
 
+                    // 메시지 업데이트
                     if (status.message !== lastMessage) {
                         showMessage('searchMessage', status.message || 'Searching...', 'info');
                         lastMessage = status.message;
                     }
 
+                    // 파일 목록 주기적 갱신 (다운로드 진행 중일 때)
+                    if (autoDownload) {
+                        loadFiles();
+                    }
+
                     if (!status.is_running && status.results && status.results.length > 0) {
-                        // 검색 완료
+                        // 검색 완료 - 결과 있음
                         clearInterval(interval);
                         results = status.results;
                         renderResults(results);
                         showMessage('searchMessage', status.message, 'success');
-
-                        if (autoDownload) {
-                            loadFiles();
+                        loadFiles();
+                        showProgress(false);
+                        btn.disabled = false;
+                        btn.innerHTML = '<span class="material-icons">search</span> Search Research';
+                    } else if (!status.is_running) {
+                        // is_running=false인데 결과가 없는 경우
+                        idleAttempts++;
+                        if (idleAttempts >= maxIdleAttempts) {
+                            clearInterval(interval);
+                            showMessage('searchMessage', status.message || 'No results found', 'warning');
+                            renderResults([]);
+                            showProgress(false);
+                            btn.disabled = false;
+                            btn.innerHTML = '<span class="material-icons">search</span> Search Research';
                         }
-                        showProgress(false);
-                        btn.disabled = false;
-                        btn.innerHTML = '<span class="material-icons">search</span> Search Research';
-                    } else if (!status.is_running && attempts > 5) {
-                        // 검색 실패 또는 결과 없음
-                        clearInterval(interval);
-                        showMessage('searchMessage', status.message || 'No results found', 'warning');
-                        renderResults([]);
-                        showProgress(false);
-                        btn.disabled = false;
-                        btn.innerHTML = '<span class="material-icons">search</span> Search Research';
-                    } else if (attempts >= maxAttempts) {
-                        clearInterval(interval);
-                        showMessage('searchMessage', 'Search timeout', 'error');
-                        showProgress(false);
-                        btn.disabled = false;
-                        btn.innerHTML = '<span class="material-icons">search</span> Search Research';
+                    } else {
+                        // is_running=true - 작업 중이면 idle 카운터 리셋
+                        idleAttempts = 0;
                     }
                 } catch (e) {
                     console.error('Search status poll error:', e);
                 }
-            }, 1000); // 1초마다 확인
+            }, 2000); // 2초마다 확인
         }
 
         // Render results
@@ -1273,8 +1275,39 @@
             textEl.textContent = text;
         }
 
-        // Initialize
-        loadFiles();
+        // Initialize - 페이지 로드 시 현재 상태 확인
+        async function initializePage() {
+            try {
+                // 파일 목록 로드
+                loadFiles();
+
+                // 현재 상태 확인
+                const response = await fetch('/api/status');
+                const status = await response.json();
+
+                // AI 상태 업데이트
+                aiEnabled = status.ai_enabled;
+
+                // 로그인 상태에 따라 UI 전환
+                if (status.logged_in) {
+                    // 로그인된 상태 - 검색 화면 표시
+                    document.getElementById('loginCard').style.display = 'none';
+                    document.getElementById('searchCard').style.display = 'block';
+                    document.getElementById('resultsCard').style.display = 'block';
+
+                    // 검색 결과가 있으면 표시
+                    if (status.results && status.results.length > 0) {
+                        results = status.results;
+                        renderResults(results);
+                        showMessage('searchMessage', status.message || `${status.results.length} documents found`, 'success');
+                    }
+                }
+            } catch (e) {
+                console.error('Initialize error:', e);
+            }
+        }
+
+        initializePage();
     </script>
 </body>
 </html>
