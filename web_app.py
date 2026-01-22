@@ -13,16 +13,65 @@ from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, render_template, request, jsonify, send_from_directory
+import re
 from limra_search_agent import LimraSearchAgent
 from sub_agents import AgentManager, SharedState
 
-# AI 기능 임포트 (선택적)
-try:
-    from ai_helper import LimraAIHelper
-    AI_AVAILABLE = True
-except ImportError:
-    AI_AVAILABLE = False
-    print("[WARN] AI 기능을 사용할 수 없습니다. ai_helper.py를 확인하세요.")
+
+def extract_year_from_doc(doc: dict) -> int:
+    """문서에서 연도 추출 (URL, 제목, 설명에서)"""
+    # 이미 연도가 있으면 반환
+    if doc.get('year'):
+        return doc['year']
+
+    # URL에서 연도 추출 (예: /2024/, /2025/)
+    url = doc.get('url', '')
+    url_year_match = re.search(r'/(\d{4})/', url)
+    if url_year_match:
+        year = int(url_year_match.group(1))
+        if 2000 <= year <= 2030:
+            return year
+
+    # 제목에서 연도 추출
+    title = doc.get('title', '')
+    title_year_match = re.search(r'\b(20\d{2})\b', title)
+    if title_year_match:
+        return int(title_year_match.group(1))
+
+    # 설명에서 연도 추출
+    desc = doc.get('description', '')
+    desc_year_match = re.search(r'\b(20\d{2})\b', desc)
+    if desc_year_match:
+        return int(desc_year_match.group(1))
+
+    return None
+
+
+def filter_docs_by_year(docs: list, start_year: int = None, end_year: int = None) -> list:
+    """문서 목록을 연도로 필터링"""
+    if not start_year and not end_year:
+        return docs
+
+    filtered = []
+    for doc in docs:
+        year = extract_year_from_doc(doc)
+        doc['year'] = year  # 추출된 연도 저장
+
+        # 연도가 없는 문서는 포함 (최신 문서일 가능성)
+        if year is None:
+            filtered.append(doc)
+            continue
+
+        # 연도 범위 체크
+        if start_year and year < start_year:
+            continue
+        if end_year and year > end_year:
+            continue
+
+        filtered.append(doc)
+
+    return filtered
+
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
 
@@ -32,7 +81,6 @@ executor = ThreadPoolExecutor(max_workers=3)
 # 전역 에이전트 및 상태
 agent = None
 agent_loop = None  # 에이전트 전용 이벤트 루프
-ai_helper = None  # AI 도우미
 
 # 서브에이전트 매니저
 agent_manager: AgentManager = None
@@ -43,41 +91,13 @@ agent_status = {
     'message': '',
     'progress': '',
     'results': [],
-    'is_running': False,
-    'ai_enabled': False
+    'is_running': False
 }
 
 # 설정
 DOWNLOAD_FOLDER = "./limra_downloads"
 Path(DOWNLOAD_FOLDER).mkdir(parents=True, exist_ok=True)
 
-# AI 자동 초기화
-def auto_init_ai():
-    """환경 변수에 API 키가 있으면 AI 자동 초기화"""
-    global ai_helper, agent_status
-
-    if not AI_AVAILABLE:
-        return
-
-    # 환경 변수에서 API 키 로드
-    api_key = os.environ.get('GROQ_API_KEY')
-    if api_key:
-        try:
-            ai_helper = LimraAIHelper(api_key=api_key)
-            agent_status['ai_enabled'] = True
-            print("[AI] AI 기능 자동 활성화됨 (Groq + Qwen 32B)")
-            print("[AI] - AI 키워드 확장")
-            print("[AI] - PDF 자동 요약")
-            print("[AI] - 종합 리포트 생성")
-        except Exception as e:
-            print(f"[AI] AI 자동 초기화 실패: {str(e)}")
-            print("[AI] 수동으로 API 키를 입력할 수 있습니다.")
-    else:
-        print("[AI] GROQ_API_KEY 환경 변수가 없습니다.")
-        print("[AI] AI 기능을 사용하려면 웹 UI에서 API 키를 입력하세요.")
-        print("[AI] https://console.groq.com/keys")
-
-auto_init_ai()
 
 
 def get_or_create_loop():
@@ -208,68 +228,6 @@ def api_login():
     })
 
 
-@app.route('/api/ai-smart-search', methods=['POST'])
-def api_ai_smart_search():
-    """AI 스마트 검색 API - 키워드로 LIMRA 사이트 검색 및 AI 분석"""
-    global agent, agent_status, ai_helper
-
-    if not agent or not agent_status['logged_in']:
-        return jsonify({'success': False, 'message': '먼저 로그인하세요.'})
-
-    if not ai_helper:
-        return jsonify({'success': False, 'message': 'AI 기능이 활성화되지 않았습니다.'})
-
-    data = request.json
-    keyword = data.get('keyword', '').strip()
-    max_pages = data.get('max_pages', 20)
-
-    if not keyword:
-        return jsonify({'success': False, 'message': '검색 키워드를 입력하세요.'})
-
-    def do_ai_search_sync():
-        global agent_status
-        agent_status['is_running'] = True
-        agent_status['message'] = f'AI 스마트 검색 중: {keyword}'
-
-        try:
-            async def do_ai_search():
-                results = await agent.ai_smart_search(
-                    keyword=keyword,
-                    ai_helper=ai_helper,
-                    max_pages=max_pages
-                )
-                return results
-
-            results = run_async(do_ai_search())
-
-            if results:
-                agent_status['message'] = f'AI 보고서 생성 완료'
-                return results
-            else:
-                agent_status['message'] = '검색 결과 없음'
-                return []
-
-        except Exception as e:
-            agent_status['message'] = f'오류: {str(e)}'
-            print(f"[ERROR] AI 스마트 검색 실패: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-
-        finally:
-            agent_status['is_running'] = False
-
-    # 백그라운드 스레드에서 AI 검색 실행
-    executor.submit(do_ai_search_sync)
-
-    # 즉시 응답 반환
-    return jsonify({
-        'success': True,
-        'message': f'AI가 "{keyword}"에 대한 콘텐츠를 검색하고 분석 중입니다...',
-        'status': 'processing'
-    })
-
-
 @app.route('/api/search', methods=['POST'])
 def api_search():
     """필터링 검색 API"""
@@ -305,6 +263,9 @@ def api_search():
                 all_results = []
                 seen_urls = set()
 
+                print(f"\n[DEBUG] 검색 시작 - keywords: {keywords}, start_year: {start_year}, end_year: {end_year}", flush=True)
+                print(f"[DEBUG] agent 상태: {agent is not None}, page 상태: {agent.page is not None if agent else 'N/A'}", flush=True)
+
                 # 1단계: LIMRA 검색 API 사용 (키워드가 있는 경우)
                 if keywords:
                     agent_status['message'] = f'LIMRA 검색 중: {", ".join(keywords)}...'
@@ -315,13 +276,20 @@ def api_search():
                             search_results = await agent.search_documents(query=kw, max_results=50)
                             print(f"[SEARCH] '{kw}' 검색 결과: {len(search_results)}개", flush=True)
 
+                            # 연도 필터 적용
+                            if start_year or end_year:
+                                search_results = filter_docs_by_year(search_results, start_year, end_year)
+                                print(f"[SEARCH] 연도 필터({start_year}-{end_year}) 적용 후: {len(search_results)}개", flush=True)
+
                             for doc in search_results:
                                 url = doc.get('url', '')
                                 if url and url not in seen_urls:
                                     seen_urls.add(url)
                                     all_results.append(doc)
                         except Exception as e:
-                            print(f"[SEARCH] 검색 오류: {e}", flush=True)
+                            import traceback
+                            print(f"[SEARCH] 검색 오류: {type(e).__name__}: {e}", flush=True)
+                            traceback.print_exc()
 
                 # 2단계: Research 섹션 탐색 (추가 문서 수집)
                 agent_status['message'] = 'Research 섹션 탐색 중...'
@@ -461,7 +429,6 @@ def api_status():
         status = agent_manager.get_status()
         # 기존 agent_status와 병합 (results는 기존 것 유지)
         status['results'] = agent_status.get('results', [])
-        status['ai_enabled'] = agent_status.get('ai_enabled', False)
         return jsonify(status)
 
     return jsonify(agent_status)
@@ -622,198 +589,6 @@ def delete_all_files():
             })
     except Exception as e:
         return jsonify({'success': False, 'message': f'삭제 실패: {str(e)}'})
-
-
-# ============= AI 기능 API =============
-
-@app.route('/api/ai/init', methods=['POST'])
-def api_ai_init():
-    """AI 초기화"""
-    global ai_helper, agent_status
-
-    if not AI_AVAILABLE:
-        return jsonify({
-            'success': False,
-            'message': 'AI 기능을 사용할 수 없습니다. ai_helper.py와 필요한 패키지를 확인하세요.'
-        })
-
-    data = request.json
-    api_key = data.get('api_key') or os.environ.get('GOOGLE_API_KEY')
-
-    if not api_key:
-        return jsonify({
-            'success': False,
-            'message': 'Google API 키가 필요합니다. https://aistudio.google.com/app/apikey'
-        })
-
-    try:
-        ai_helper = LimraAIHelper(api_key=api_key)
-        agent_status['ai_enabled'] = True
-        return jsonify({
-            'success': True,
-            'message': 'AI 기능이 활성화되었습니다 (Gemini 2.0 Flash)'
-        })
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'message': f'AI 초기화 실패: {str(e)}'
-        })
-
-
-@app.route('/api/ai/expand-keywords', methods=['POST'])
-def api_ai_expand_keywords():
-    """AI 키워드 확장"""
-    global ai_helper
-
-    if not ai_helper:
-        return jsonify({
-            'success': False,
-            'message': '먼저 AI를 초기화하세요.'
-        })
-
-    data = request.json
-    keyword = data.get('keyword', '')
-    industry = data.get('industry', 'insurance')
-    count = data.get('count', 10)
-
-    if not keyword:
-        return jsonify({
-            'success': False,
-            'message': '키워드를 입력하세요.'
-        })
-
-    def expand_keywords_sync():
-        try:
-            result = ai_helper.expand_keywords(keyword, industry=industry, count=count)
-            return result
-        except Exception as e:
-            return {'error': str(e)}
-
-    # 백그라운드 실행
-    future = executor.submit(expand_keywords_sync)
-    result = future.result(timeout=30)  # 30초 타임아웃
-
-    if 'error' in result:
-        return jsonify({
-            'success': False,
-            'message': result['error']
-        })
-
-    return jsonify({
-        'success': True,
-        'original_keyword': keyword,
-        'all_keywords': result.get('all_keywords', []),
-        'synonyms': result.get('synonyms', []),
-        'related_concepts': result.get('related_concepts', []),
-        'specific_topics': result.get('specific_topics', []),
-        'metrics': result.get('metrics', []),
-        'search_suggestions': result.get('search_suggestions', [])
-    })
-
-
-@app.route('/api/ai/summarize-pdf', methods=['POST'])
-def api_ai_summarize_pdf():
-    """PDF 요약"""
-    global ai_helper
-
-    if not ai_helper:
-        return jsonify({
-            'success': False,
-            'message': '먼저 AI를 초기화하세요.'
-        })
-
-    data = request.json
-    filename = data.get('filename', '')
-    language = data.get('language', 'ko')
-
-    if not filename:
-        return jsonify({
-            'success': False,
-            'message': '파일명을 입력하세요.'
-        })
-
-    pdf_path = Path(DOWNLOAD_FOLDER) / filename
-
-    if not pdf_path.exists():
-        return jsonify({
-            'success': False,
-            'message': f'파일을 찾을 수 없습니다: {filename}'
-        })
-
-    def summarize_pdf_sync():
-        try:
-            result = ai_helper.summarize_pdf(str(pdf_path), language=language)
-            return result
-        except Exception as e:
-            return {'error': str(e)}
-
-    # 백그라운드 실행
-    agent_status['message'] = f'PDF 요약 중: {filename}'
-    future = executor.submit(summarize_pdf_sync)
-    result = future.result(timeout=120)  # 2분 타임아웃
-
-    if 'error' in result:
-        return jsonify({
-            'success': False,
-            'message': result['error']
-        })
-
-    return jsonify({
-        'success': True,
-        'filename': filename,
-        'summary': result.get('summary', {})
-    })
-
-
-@app.route('/api/ai/generate-report', methods=['POST'])
-def api_ai_generate_report():
-    """종합 리포트 생성"""
-    global ai_helper, agent_status
-
-    if not ai_helper:
-        return jsonify({
-            'success': False,
-            'message': '먼저 AI를 초기화하세요.'
-        })
-
-    data = request.json
-    keyword = data.get('keyword', '')
-    summaries = data.get('summaries', [])
-    language = data.get('language', 'ko')
-
-    if not keyword:
-        return jsonify({
-            'success': False,
-            'message': '키워드를 입력하세요.'
-        })
-
-    def generate_report_sync():
-        try:
-            result = ai_helper.generate_comprehensive_report(
-                keyword=keyword,
-                summaries=summaries,
-                language=language
-            )
-            return result
-        except Exception as e:
-            return {'error': str(e)}
-
-    # 백그라운드 실행
-    agent_status['message'] = '종합 리포트 생성 중...'
-    future = executor.submit(generate_report_sync)
-    result = future.result(timeout=120)  # 2분 타임아웃
-
-    if 'error' in result:
-        return jsonify({
-            'success': False,
-            'message': result['error']
-        })
-
-    return jsonify({
-        'success': True,
-        'keyword': keyword,
-        'report': result.get('report', '')
-    })
 
 
 def init_agent_manager():
