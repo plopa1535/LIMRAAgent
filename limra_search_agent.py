@@ -1531,74 +1531,127 @@ class LimraSearchAgent:
                 try:
                     print(f"  [LINK] PDF URL 발견: {pdf_link[:50]}...")
 
-                    async with self.page.expect_download(timeout=60000) as download_info:
-                        # JavaScript로 다운로드 트리거
-                        await self.page.evaluate(f'''
-                            () => {{
-                                const a = document.createElement('a');
-                                a.href = "{pdf_link}";
-                                a.download = "";
-                                a.style.display = "none";
-                                document.body.appendChild(a);
-                                a.click();
-                                document.body.removeChild(a);
-                            }}
-                        ''')
+                    # 방법 1: JavaScript 클릭으로 다운로드 시도
+                    try:
+                        async with self.page.expect_download(timeout=30000) as download_info:
+                            # JavaScript로 다운로드 트리거
+                            await self.page.evaluate(f'''
+                                () => {{
+                                    const a = document.createElement('a');
+                                    a.href = "{pdf_link}";
+                                    a.download = "";
+                                    a.style.display = "none";
+                                    document.body.appendChild(a);
+                                    a.click();
+                                    document.body.removeChild(a);
+                                }}
+                            ''')
 
-                    download = await download_info.value
-                    suggested_filename = download.suggested_filename
-                    if suggested_filename:
-                        ext = Path(suggested_filename).suffix
-                        if ext:
-                            filepath = filepath.with_suffix(ext)
+                        download = await download_info.value
+                        suggested_filename = download.suggested_filename
+                        if suggested_filename:
+                            ext = Path(suggested_filename).suffix
+                            if ext:
+                                filepath = filepath.with_suffix(ext)
 
-                    await download.save_as(str(filepath))
-                    print(f"[OK] 실제 파일 저장됨: {filepath}")
-                    return str(filepath)
+                        await download.save_as(str(filepath))
+
+                        # 파일 크기 검증
+                        if filepath.exists() and filepath.stat().st_size > 0:
+                            print(f"[OK] 실제 파일 저장됨: {filepath}")
+                            return str(filepath)
+                        else:
+                            print(f"[WARN] 파일이 비어있음, 다른 방법 시도")
+                            if filepath.exists():
+                                filepath.unlink()  # 빈 파일 삭제
+                    except Exception as js_err:
+                        print(f"[WARN] JS 다운로드 실패: {js_err}")
+
+                    # 방법 2: Playwright로 PDF URL 직접 navigate하여 다운로드
+                    print(f"  [LINK] Playwright로 PDF 직접 다운로드 시도...")
+                    try:
+                        # 새 페이지에서 PDF URL로 직접 이동하여 다운로드
+                        async with self.page.expect_download(timeout=60000) as download_info:
+                            # PDF URL로 직접 이동
+                            await self.page.goto(pdf_link, timeout=60000)
+
+                        download = await download_info.value
+                        suggested_filename = download.suggested_filename
+                        if suggested_filename:
+                            ext = Path(suggested_filename).suffix
+                            if ext:
+                                filepath = filepath.with_suffix(ext)
+
+                        await download.save_as(str(filepath))
+
+                        # 파일 크기 검증
+                        if filepath.exists() and filepath.stat().st_size > 0:
+                            print(f"[OK] 실제 파일 저장됨: {filepath}")
+                            return str(filepath)
+                        else:
+                            print(f"[WARN] 파일이 비어있음")
+                            if filepath.exists():
+                                filepath.unlink()
+                    except Exception as nav_err:
+                        print(f"[WARN] navigate 다운로드 실패: {nav_err}")
+
+                    # 방법 3: Playwright API Request로 다운로드 (브라우저 세션 쿠키 사용)
+                    print(f"  [LINK] Playwright API로 다운로드 시도...")
+                    try:
+                        api_request = await self.context.request.get(pdf_link)
+                        if api_request.ok:
+                            content = await api_request.body()
+                            content_type = api_request.headers.get('content-type', '')
+
+                            if len(content) > 1000 and ('application/pdf' in content_type or content[:4] == b'%PDF'):
+                                if filepath.suffix != '.pdf':
+                                    filepath = filepath.with_suffix('.pdf')
+                                with open(filepath, 'wb') as f:
+                                    f.write(content)
+                                print(f"[OK] Playwright API로 저장됨: {filepath}")
+                                return str(filepath)
+                            else:
+                                print(f"[WARN] PDF가 아니거나 내용이 없음 (size: {len(content)}, type: {content_type})")
+                        else:
+                            print(f"[WARN] API 요청 실패: {api_request.status}")
+                    except Exception as api_err:
+                        print(f"[WARN] API 다운로드 실패: {api_err}")
 
                 except Exception as e:
                     print(f"[WARN] PDF URL 다운로드 실패: {e}")
 
             # 다운로드 링크를 찾지 못한 경우
-            # headless=False에서는 page.pdf()가 작동하지 않음
-            # requests로 직접 다운로드 시도
-            print(f"[WARN] 다운로드 링크 없음, requests로 직접 다운로드 시도")
+            # Playwright API를 사용하여 다운로드 시도 (브라우저 세션 쿠키 자동 사용)
+            print(f"[WARN] 다운로드 링크 없음, Playwright API로 직접 다운로드 시도")
 
             try:
-                # 브라우저 쿠키를 requests 세션으로 복사
-                cookies = await self.context.cookies()
-                session = requests.Session()
-                for cookie in cookies:
-                    session.cookies.set(cookie['name'], cookie['value'], domain=cookie.get('domain', ''))
+                api_request = await self.context.request.get(url)
+                if api_request.ok:
+                    content = await api_request.body()
+                    content_type = api_request.headers.get('content-type', '')
 
-                # User-Agent 설정
-                session.headers.update({
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                })
+                    # PDF 여부 확인 (Content-Type 또는 파일 시그니처로)
+                    is_pdf = ('application/pdf' in content_type or
+                              url.endswith('.pdf') or
+                              (len(content) > 4 and content[:4] == b'%PDF'))
 
-                # PDF 다운로드 시도 (URL에 .pdf가 있거나 Content-Type이 PDF인 경우)
-                response = session.get(url, stream=True, timeout=60)
+                    if is_pdf and len(content) > 1000:
+                        if filepath.suffix != '.pdf':
+                            filepath = filepath.with_suffix('.pdf')
 
-                content_type = response.headers.get('Content-Type', '')
+                        with open(filepath, 'wb') as f:
+                            f.write(content)
 
-                if 'application/pdf' in content_type or url.endswith('.pdf'):
-                    # PDF 파일인 경우 저장
-                    if filepath.suffix != '.pdf':
-                        filepath = filepath.with_suffix('.pdf')
-
-                    with open(filepath, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-
-                    print(f"[OK] requests로 PDF 저장됨: {filepath}")
-                    return str(filepath)
+                        print(f"[OK] Playwright API로 PDF 저장됨: {filepath}")
+                        return str(filepath)
+                    else:
+                        print(f"[INFO] PDF가 아님 (Content-Type: {content_type}, size: {len(content)}), 건너뜀")
+                        return None
                 else:
-                    # PDF가 아닌 경우 - HTML 페이지를 텍스트로 저장
-                    print(f"[INFO] PDF가 아님 (Content-Type: {content_type}), 건너뜀")
-                    return None
+                    print(f"[WARN] API 요청 실패: {api_request.status}")
 
             except Exception as e:
-                print(f"[WARN] requests 다운로드 실패: {e}")
+                print(f"[WARN] Playwright API 다운로드 실패: {e}")
 
             # headless 모드에서만 page.pdf() 시도
             if self.headless:
